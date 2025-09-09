@@ -5997,6 +5997,7 @@ def meta__scaled_dot_product_fused_attention_overrideable(
     is_causal: bool = False,
     return_debug_mask: bool = False,
     scale: float | None = None,
+    compute_log_sumexp: bool = False
 ):
     # Explicitly handle 3D (H, S, D) and 4D (B, H, S, D) inputs,
     # matching the C++ runtime in aten_mtia_ops.cpp.
