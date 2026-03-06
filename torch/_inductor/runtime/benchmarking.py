@@ -488,8 +488,29 @@ class TorchProfilerBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
             0,
         )
 
+        # When cudagraphs is active, kernel launch overhead is set to zero.
+        # Otherwise, the overhead will be the HIP or CUDA launcher call
+        # on the CPU. TO DO: Overhead calculation may not always be accurate.
+        if inductor_config.triton.cudagraphs:
+            callable_time_launch_overhead_us = 0
+        else:
+            _launch_kernel_keys = {
+                "hipModuleLaunchKernel",
+                "hipExtModuleLaunchKernel",
+                "cuLaunchKernel",
+                "cuLaunchKernelEx",
+            }
+            callable_time_launch_overhead_us = sum(
+                event.cpu_time_total
+                for event in prof.key_averages()
+                if event.device_type == torch.profiler.DeviceType.CPU
+                and event.key in _launch_kernel_keys
+            )
+
         # Convert to milliseconds and compute the average time per iteration
-        avg_time_ms = (callable_time_us / rep) / 1000.0
+        avg_time_ms = (
+            (callable_time_us + callable_time_launch_overhead_us) / rep
+        ) / 1000.0
 
         # explicitly delete the buffer, sometimes helps memory
         # footprint metrics in OSS Inductor performance benchmarks
