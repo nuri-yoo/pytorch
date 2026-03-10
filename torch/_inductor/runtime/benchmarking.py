@@ -509,7 +509,7 @@ class TorchProfilerBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         #   - If driver API tracing is on, cuLaunchKernel captures ALL launches
         #     (including buffer.zero_()) because the runtime API calls through
         #     to the driver API, breaking the scoping.
-        if triton_config.cudagraphs:
+        if inductor_config.triton.cudagraphs:
             callable_time_launch_overhead_us = 0
         else:
             _launch_overhead_keys = {
