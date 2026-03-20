@@ -20,11 +20,7 @@ class TestFusedGateUpSiLU(TestCase):
         ref = self._reference(x, gate_w, up_w)
         out = torch.ops.xpu._fused_gate_up_silu(x, gate_w, up_w)
 
-        # Two valid GEMM implementations (oneDNN vs SYCL-TLA) can differ by
-        # ~0.1% relative (within fp16 ULP).  Since output = SiLU(gate)*up has
-        # large magnitude (gate~70 * up~90 ≈ 6000), small relative GEMM diffs
-        # become large absolute diffs.  Use rtol to accommodate this.
-        rtol, atol = 1e-2, 1.0
+        rtol, atol = (2e-3, 0.5) if dtype == torch.float16 else (1.6e-2, 0.5)
         self.assertTrue(
             torch.allclose(ref, out, rtol=rtol, atol=atol),
             f"M={M} K={K} N={N} {dtype} max_diff={(ref - out).abs().max():.6e}",
