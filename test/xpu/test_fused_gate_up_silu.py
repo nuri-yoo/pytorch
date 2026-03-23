@@ -2,8 +2,12 @@
 
 import torch
 import torch.nn.functional as F
-from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_device_type import (
+    instantiate_device_type_tests,
+    skipXPUIf,
+)
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_xpu import PLATFORM_SUPPORTS_SYCLTLA
 
 
 class TestFusedGateUpSiLU(TestCase):
@@ -26,11 +30,13 @@ class TestFusedGateUpSiLU(TestCase):
             f"M={M} K={K} N={N} {dtype} max_diff={(ref - out).abs().max():.6e}",
         )
 
+    @skipXPUIf(not PLATFORM_SUPPORTS_SYCLTLA, "")
     def test_fp16_shapes(self, device):
         for M in [1, 4, 32, 64, 128]:
             for K, N in [(512, 1384), (4096, 11008)]:
                 self._test_shape_dtype(device, M, K, N, torch.float16)
 
+    @skipXPUIf(not PLATFORM_SUPPORTS_SYCLTLA, "")
     def test_bf16_shapes(self, device):
         for M in [1, 4, 32, 64, 128]:
             self._test_shape_dtype(device, M, 512, 1384, torch.bfloat16)
