@@ -13,6 +13,7 @@ import torch._inductor.config as inductor_config
 import torch.utils._pytree as pytree
 from torch._dynamo.utils import counters
 from torch.utils._debug_mode import DebugMode
+from torch.utils._ordered_set import OrderedSet
 
 
 logger = torch._logging.getArtifactLogger(__name__, "benchmarking")
@@ -515,6 +516,7 @@ class TorchProfilerBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         # processing: _parse_kineto_results (wrapping every raw event in
         # a Python FunctionEvent), _build_tree, and grouping/aggregation.
         from torch.autograd import DeviceType as _DeviceType
+
         callable_gpu_time_us = 0.0
         for kineto_event in prof.profiler.kineto_results.events():
             if (
@@ -544,17 +546,19 @@ class TorchProfilerBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         if inductor_config.triton.cudagraphs:
             callable_time_launch_overhead_us = 0
         else:
-            _launch_overhead_keys = {
-                "hipModuleLaunchKernel",
-                "hipExtModuleLaunchKernel",
-                "cuLaunchKernel",
-                "cuLaunchKernelEx",
-                "hipMemcpyAsync",
-                "cudaMemcpyAsync",
-                "cuMemcpyAsync",
-                "cuMemcpyDtoD",
-                "cuMemcpyDtoDAsync",
-            }
+            _launch_overhead_keys = OrderedSet(
+                [
+                    "hipModuleLaunchKernel",
+                    "hipExtModuleLaunchKernel",
+                    "cuLaunchKernel",
+                    "cuLaunchKernelEx",
+                    "hipMemcpyAsync",
+                    "cudaMemcpyAsync",
+                    "cuMemcpyAsync",
+                    "cuMemcpyDtoD",
+                    "cuMemcpyDtoDAsync",
+                ]
+            )
             callable_time_launch_overhead_us = sum(
                 event.cpu_time_total
                 for event in prof.key_averages()
