@@ -566,6 +566,9 @@ class TorchProfilerBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
                 and event.key in _launch_overhead_keys
             )
 
+        # temporary hack, we set callable_time_launch_overheard_us to zero
+        callable_time_launch_overhead_us = 0
+
         # GPU execution and CPU launch happen on overlapping timelines (the
         # CPU launches asynchronously while the GPU executes), so adding them
         # would double-count. Taking the max gives the true bottleneck: GPU
