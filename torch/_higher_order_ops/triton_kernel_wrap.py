@@ -1140,6 +1140,10 @@ def identify_accessed_tensors(
             if isinstance(kwargs.get(name), (Tensor, TensorBox))
         )
 
+        return KernelAccessAnalyzer(
+            functions, kernel_name, tuple(ordered_arg_names)
+        ).analyze()
+
         return analyze_kernel_access(
             functions,
             kernel_name,
@@ -2401,3 +2405,239 @@ class TraceableTritonKernelWrapper:
         if isinstance(arg, (torch.SymInt, torch.SymBool, torch.SymFloat)):
             return guard_scalar(arg)
         return arg
+
+
+class KernelAccessAnalyzer:
+    def __init__(
+        self,
+        functions: dict[str, dict[Intermediate, list[Op]]],
+        fn_name: str,
+        tensor_names: tuple[str, ...],
+    ):
+        self.WRITE_OPS = {
+            "tt.store": [0],
+            "tt.atomic_cas": [0],
+            "tt.atomic_rmw": [0],
+            "tt.experimental_descriptor_store": [0],
+            "tt.experimental_tensormap_create": [0],
+            "tt.descriptor_store": [0],
+        }
+        self.READ_OPS = {
+            "tt.load": [0],
+            "tt.load_tensor_descriptor": [0],
+            "tt.descriptor_load": [0],
+        }
+        self.UNKNOWN_OPS = {"tt.elementwise_inline_asm"}
+        self.op_handlers = {}
+
+        self.functions = functions
+        self.fn_name = fn_name
+        self.num_args = len(tensor_names)
+        self.tensor_names = tensor_names
+
+        self.write_accesses: dict[int, sympy.Expr | int] = {}
+        self.read_accesses: dict[int, sympy.Expr | int] = {}
+
+        import torch._inductor.config
+        self.extract_symbolic = torch._inductor.config.epilogue_fusion_user_defined_triton_kernel
+        # self.extract_symbolic = False
+        self._symbolic = SymbolicAnalyzer(self) if self.extract_symbolic else None
+
+    def get_sinks(
+        self, fn_name: str
+    ) -> tuple[list[Param | Intermediate], list[Param | Intermediate]]:
+        ops = self.functions[fn_name]
+
+        tma_stores = get_tma_stores(self.functions, fn_name)
+
+        write_sinks: list[Param | Intermediate] = []
+        read_sinks: list[Param | Intermediate] = []
+
+        for op_list in ops.values():
+            for op in op_list:
+                op_name = op.name
+                # If we encounter an operation with effects that cannot be reliably analyzed
+                # (e.g. `tt.elementwise_inline_asm`), we assume it does not mutate any input parameters.
+                if op_name in self.UNKNOWN_OPS:
+                    if op_name == "tt.elementwise_inline_asm" and op.is_pure:
+                        continue
+                    raise RuntimeError(
+                        f"ttir analysis hit an op we do not know how to analyze: {op.name}"
+                    )
+
+                # NOTE: This is how we implement experimental_descriptor_store mutation_analysis.
+                # for on-device TMA.
+                # experimental_tensormap_store(a, b, ...) stores b to the location specified
+                # by descriptor in the memory of a.
+                # To track this, we first fgind all the intermediates/params to which we stored via
+                # experminetal_tensormap_store (get_tma_stores, called above). then, during this analysis
+                # we wait to find the corresponding experimental_tensormap_create (if it exists), at which
+                # point we will mark the global_ptr as mutated (as done below).
+                if op_name == "tt.experimental_tensormap_create":
+                    if len(op.args) < 2:
+                        raise AssertionError(
+                            f"tt.experimental_tensormap_create expected at least 2 args, "
+                            f"got {len(op.args)}"
+                        )
+                    if op.args[0] in tma_stores:
+                        write_sinks.append(op.args[1])
+
+                # TODO: test symbolic analysis on inner tt.call
+                elif op_name == "tt.call":
+                    fn_call_name = op.fn_call_name
+                    if fn_call_name not in self.functions:
+                        raise AssertionError(
+                            f"Function {op.fn_call_name} not found in functions dict"
+                        )
+
+                    nested_names = tuple(f"_arg{i}" for i in range(len(op.args)))
+                    nested = KernelAccessAnalyzer(
+                        self.functions,
+                        fn_call_name,
+                        nested_names,
+                    ).analyze()
+                    written_set = {dep.name for dep in nested.read_writes.writes}
+                    read_set = {dep.name for dep in nested.read_writes.reads}
+                    for arg, name in zip(op.args, nested_names):
+                        if name in written_set:
+                            write_sinks.append(arg)
+                        if name in read_set:
+                            read_sinks.append(arg)
+
+                # TODO: We need to worry about masks as well, but only
+                # for symbolic tracing.
+                elif indices := self.WRITE_OPS.get(op_name):
+                    write_sinks.extend(op.args[idx] for idx in indices)
+                elif indices := self.READ_OPS.get(op_name):
+                    read_sinks.extend(op.args[idx] for idx in indices)
+
+        return read_sinks, write_sinks
+
+    def _analyze_sinks(
+        self,
+        sinks: list[Param | Intermediate],
+        accesses: dict[int, sympy.Expr | int],
+        skip_loads: bool,
+    ):
+
+        # TODO: It would be nice to share recursion state, as in, continue
+        # on current node during symbolic tracing, sharing the same recursion stack
+        # in the even of a fallback.
+        # However, seperate stacks does prevent very unlikley stack smashes
+        # This also allows Param handling to be simpler; symbolic tracing
+        # handles Sympy.expr, and conservativ tracing handles access counts.
+        ops = self.functions[self.fn_name]
+        conservative = ConservativeAnalyzer(self)
+
+        for sink in sinks:
+            if self.extract_symbolic:
+                try:
+                    self._symbolic.traverse(sink, ops, accesses)
+                except Exception:
+                    # log.debug(
+                    #     "Symbolic analysis failed at op '%s', switching to conservative",
+                    #     e.op_name,
+                    # )
+                    self.extract_symbolic = False
+                    conservative.traverse(sink, ops, skip_loads, accesses)
+            else:
+                conservative.traverse(sink, ops, skip_loads, accesses)
+
+    def analyze(self):
+        read_sinks, write_sinks = self.get_sinks(self.fn_name)
+
+        self._analyze_sinks(write_sinks, self.write_accesses, skip_loads=True)
+        self._analyze_sinks(read_sinks, self.read_accesses, skip_loads=False)
+
+        from torch._inductor.dependencies import ReadWrites, StarDep
+        from torch.utils._ordered_set import OrderedSet
+
+        writes = OrderedSet(
+            StarDep(self.tensor_names[i]) for i in sorted(self.write_accesses.keys())
+        )
+        reads = OrderedSet(
+            StarDep(self.tensor_names[i]) for i in sorted(self.read_accesses.keys())
+        )
+
+        return TensorAccesses(
+            read_writes=ReadWrites(
+                reads=reads, writes=writes, index_exprs=OrderedSet()
+            ),
+            can_fuse_epilogue=self._decide_can_fuse_epilogue(),
+        )
+
+    def _decide_can_fuse_epilogue(self) -> bool:
+        if len(self.write_accesses) != 1:
+            return False
+        written_idx = next(iter(self.write_accesses))
+        if self.write_accesses[written_idx] != 1:
+            return False
+        written_name = self.tensor_names[written_idx]
+        if any(self.tensor_names[i] == written_name for i in self.read_accesses):
+            return False
+        return True
+
+
+class ConservativeAnalyzer:
+    def __init__(self, analyzer: KernelAccessAnalyzer):
+        self.analyzer = analyzer
+
+    def traverse(
+        self,
+        node: Param | Intermediate,
+        ops: dict[Intermediate, list[Op]],
+        skip_loads: bool,
+        accesses: dict[int, sympy.Expr | int],
+    ):
+        stack = [node]
+
+        while stack:
+            arg = stack.pop()
+
+            if isinstance(arg, Param):
+                if arg.idx >= self.analyzer.num_args:
+                    continue
+                accesses[arg.idx] = accesses.get(arg.idx, 0) + 1
+            elif isinstance(arg, Intermediate) and not arg.fake():
+                for op in ops[arg]:
+                    if skip_loads and op.name == "tt.load":
+                        continue
+                    stack.extend(op.args)
+
+
+class SymbolicFailure(Exception):
+    def __init__(self, op_name: str):
+        self.op_name = op_name
+        super().__init__(f"Symbolic analysis failed at op '{op_name}'")
+
+
+class SymbolicAnalyzer:
+    def __init__(self, analyzer: KernelAccessAnalyzer):
+        self.analyzer = analyzer
+
+        self.op_handlers: dict[str, Callable] = {}
+
+    def traverse(
+        self,
+        sink: Intermediate | Param,
+        ops: dict[Intermediate, list[Op]],
+        accesses: dict[int, sympy.Expr | int],
+    ):
+        raise SymbolicFailure(op.name)
+        self.ops = ops
+        self.accesses = accesses
+        return self._build_expr(sink)
+
+    def _build_expr(self, node: Intermediate | Param):
+        print(f"{node=} {node.idx=}")
+
+        if isinstance(node, Intermediate):
+            op_list = self.ops.get(node)
+
+            assert op_list is not None
+            op = op_list[0]
+            name = op.name
+
+            handler = self.op_handlers.get(op.name)
+            if handler is None:
+                raise SymbolicFailure(op.name)
