@@ -54,7 +54,7 @@ from .comm_analysis import (
     estimate_nccl_collective_runtime,
     estimate_nccl_collective_runtime_nccl_estimator,
 )
-from .dependencies import Dep, MemoryDep, StarDep, WeakDep
+from .dependencies import Dep, MemoryDep, StarDep, UserTritonDep, WeakDep
 from .exc import GPUTooOldForTriton, TritonMissing
 from .fx_utils import count_flops_fx
 from .ir import (
@@ -5830,6 +5830,10 @@ class Scheduler:
             if not isinstance(node1.node, ir.UserDefinedTritonKernel):
                 why("node1 is extern but not a triton kernel")
                 return False
+            written_buffer_name = node1.node.mutation_outputs[0].name
+            if written_buffer_name in self.mutation_renames:
+                why("output buffer involved in buffer reuse")
+                return False
 
             if not node1.node.can_fuse_epilogue():
                 why("node1's triton kernel doesn't support epilogue fusion")
@@ -6049,7 +6053,7 @@ class Scheduler:
             remaining_deps_by_name[name].append(dep)
 
         for cd in node1.read_writes.writes:
-            if not isinstance(cd, MemoryDep) and not isinstance(cd, StarDep):
+            if not isinstance(cd, MemoryDep) and not isinstance(cd, UserTritonDep):
                 continue
             remaining = remaining_deps_by_name.get(
                 self.mutation_renames.get(cd.name, cd.name)
@@ -6061,8 +6065,8 @@ class Scheduler:
                     ):
                         remaining.remove(rd)  # noqa: B909
                     elif isinstance(
-                        cd, StarDep
-                    ) and self.fusable_stardep_write_and_read_on_empty_tensor(
+                        cd, UserTritonDep
+                    ) and self.fusable_usertritondep_write_and_read_on_empty_tensor(
                         rd, cd, node1.node
                     ):
                         remaining.remove(rd)  # noqa: B909
@@ -6105,7 +6109,7 @@ class Scheduler:
         if len(mutating_writes) != 1:
             return False
         write = mutating_writes[0]
-        if isinstance(write, StarDep):
+        if isinstance(write, (StarDep, UserTritonDep)):
             return False
         assert isinstance(write, MemoryDep)
 
@@ -6185,11 +6189,12 @@ class Scheduler:
                 return True
         return False
 
+    # FIXME: Moving away from StarDep
     # on tensors that are "empty" (i.e. with undefined values),
     # we relax the conditions for fusion and additionally allow matching a writing StarDep with any read dep.
     # This makes use of the fact that `f(UB) = UB`.
-    def fusable_stardep_write_and_read_on_empty_tensor(
-        self, read: Dep, write: StarDep, writing_node: ir.Operation | None
+    def fusable_usertritondep_write_and_read_on_empty_tensor(
+        self, read: Dep, write: UserTritonDep, writing_node: ir.Operation | None
     ) -> bool:
         if not isinstance(writing_node, ir.UserDefinedTritonKernel):
             return False
@@ -6197,9 +6202,7 @@ class Scheduler:
             return False
         read_name = self.mutation_renames.get(read.name, read.name)
         write_name = self.mutation_renames.get(write.name, write.name)
-        if isinstance(write, StarDep) and read_name == write_name:
-            return True
-        return False
+        return read_name == write_name
 
     def dep_size_hint(self, dep: Dep, count_bytes: bool = True) -> int:
         return V.graph.get_dep_size_hint(dep, count_bytes)
@@ -6267,6 +6270,10 @@ class Scheduler:
                 if isinstance(dep1, (StarDep, MemoryDep)) and isinstance(
                     dep2, (StarDep, MemoryDep)
                 ):
+                    return dep1.name == dep2.name
+                if (
+                    isinstance(dep1, UserTritonDep) and isinstance(dep2, MemoryDep)
+                ) or (isinstance(dep2, UserTritonDep) and isinstance(dep1, MemoryDep)):
                     return dep1.name == dep2.name
                 return False
 

@@ -1142,7 +1142,7 @@ def identify_accessed_tensors(
         ttir_module, ordered_arg_names = generate_ttir(
             kernel, kwargs, tma_descriptor_metadata
         )
-        print(ttir_module)
+        # print(ttir_module)
 
         # extract functions from TTIR using MLIR bindings exposed by Triton code
         functions = ttir_to_functions(ttir_module)
@@ -2450,6 +2450,8 @@ class KernelAccessAnalyzer:
         grid: Any,
         tensor_names: tuple[str, ...],
     ):
+        from torch._inductor.dependencies import UserTritonDep
+
         self.WRITE_OPS = {
             "tt.store": [0],
             "tt.atomic_cas": [0],
@@ -2473,8 +2475,8 @@ class KernelAccessAnalyzer:
         self.grid = grid
         self.tensor_names = tensor_names
 
-        self.write_accesses: dict[int, sympy.Expr | int] = {}
-        self.read_accesses: dict[int, sympy.Expr | int] = {}
+        self.write_accesses: dict[int, list[UserTritonDep | int]] = {}
+        self.read_accesses: dict[int, list[UserTritonDep | int]] = {}
 
         import torch._inductor.config
 
@@ -2482,7 +2484,6 @@ class KernelAccessAnalyzer:
             torch._inductor.config.epilogue_fusion_user_defined_triton_kernel
         )
         self.extract_symbolic = epilogue_fusion and self.grid is not None
-        print(f"{self.extract_symbolic=} {grid=}")
         self._symbolic = SymbolicAnalyzer(self) if self.extract_symbolic else None
 
     def get_sinks(
@@ -2560,17 +2561,20 @@ class KernelAccessAnalyzer:
     def _analyze_sinks(
         self,
         sinks: list[Param | Intermediate],
-        accesses: dict[int, sympy.Expr | int],
+        accesses: dict[int, list[sympy.Expr | int]],
         skip_loads: bool,
     ):
-        # TODO: It would be nice to share recursion state, as in, continue
-        # on current node during symbolic tracing, sharing the same recursion stack
-        # in the even of a fallback.
-        # However, seperate stacks does prevent very unlikley stack smashes
-        # This also allows Param handling to be simpler; symbolic tracing
-        # handles Sympy.expr, and conservativ tracing handles access counts.
+        # NOTE: It would be preferred to share recursion state. Specifically,
+        # to continue conservative tracing from the current node in the event
+        # of failure during symbolic tracing. This would imply that the recursion
+        # stack would have to be shared.
+        #
+        # However, seperate stacks does prevent very unlikley stack smashes during
+        # symbolic tracing/recursion.
+        # Seperate states also allow for simpler Param handling: symbolic tracing
+        # handles Sympy.expr, and conservative tracing handles access counts.
         ops = self.functions[self.fn_name]
-        conservative = ConservativeAnalyzer(self)
+        conservative = ConservativeAnalyzer(self.num_args)
 
         for sink in sinks:
             if self.extract_symbolic:
@@ -2582,9 +2586,9 @@ class KernelAccessAnalyzer:
                     #     e.op_name,
                     # )
                     self.extract_symbolic = False
-                    conservative.traverse(sink, ops, skip_loads, accesses)
+                    conservative.traverse(sink, ops, accesses, skip_loads)
             else:
-                conservative.traverse(sink, ops, skip_loads, accesses)
+                conservative.traverse(sink, ops, accesses, skip_loads)
 
     def analyze(self):
         read_sinks, write_sinks = self.get_sinks(self.fn_name)
@@ -2592,16 +2596,32 @@ class KernelAccessAnalyzer:
         self._analyze_sinks(write_sinks, self.write_accesses, skip_loads=True)
         self._analyze_sinks(read_sinks, self.read_accesses, skip_loads=False)
 
-        from torch._inductor.dependencies import ReadWrites, StarDep
+        from torch._inductor.dependencies import ReadWrites, UserTritonDep
         from torch.utils._ordered_set import OrderedSet
 
         # TODO: Change to MemoryDep or introduce new UserTritonDep.
-        writes = OrderedSet(
-            StarDep(self.tensor_names[i]) for i in sorted(self.write_accesses.keys())
-        )
-        reads = OrderedSet(
-            StarDep(self.tensor_names[i]) for i in sorted(self.read_accesses.keys())
-        )
+        if self.extract_symbolic:
+            writes = OrderedSet(
+                dep
+                for i in sorted(self.write_accesses.keys())
+                for dep in self.write_accesses[i]
+                if isinstance(dep, UserTritonDep)
+            )
+            reads = OrderedSet(
+                dep
+                for i in sorted(self.read_accesses.keys())
+                for dep in self.read_accesses[i]
+                if isinstance(dep, UserTritonDep)
+            )
+        else:
+            writes = OrderedSet(
+                UserTritonDep(name=self.tensor_names[i], index=None)
+                for i in sorted(self.write_accesses.keys())
+            )
+            reads = OrderedSet(
+                UserTritonDep(name=self.tensor_names[i], index=None)
+                for i in sorted(self.read_accesses.keys())
+            )
 
         return TensorAccesses(
             read_writes=ReadWrites(
@@ -2611,27 +2631,35 @@ class KernelAccessAnalyzer:
         )
 
     def _decide_can_fuse_epilogue(self) -> bool:
+        print(f"{self.write_accesses=}")
+        print(f"{self.read_accesses=}")
+        # only do epilogue fusion if the kernel has a single output tensor
         if len(self.write_accesses) != 1:
             return False
+
         written_idx = next(iter(self.write_accesses))
-        if self.write_accesses[written_idx] != 1:
+        # only do epilogue fusion if the written tensor is written exactly once
+        if len(self.write_accesses[written_idx]) != 1:
             return False
+
+        #  cannot fuse if the kernel also reads from the output buffer
         written_name = self.tensor_names[written_idx]
         if any(self.tensor_names[i] == written_name for i in self.read_accesses):
             return False
+
         return True
 
 
 class ConservativeAnalyzer:
-    def __init__(self, analyzer: KernelAccessAnalyzer):
-        self.analyzer = analyzer
+    def __init__(self, num_args: int):
+        self.num_args = num_args
 
     def traverse(
         self,
         node: Param | Intermediate,
         ops: dict[Intermediate, list[Op]],
+        accesses: dict[int, list[sympy.Expr | int]],
         skip_loads: bool,
-        accesses: dict[int, sympy.Expr | int],
     ):
         stack = [node]
 
@@ -2639,15 +2667,18 @@ class ConservativeAnalyzer:
             arg = stack.pop()
 
             if isinstance(arg, Param):
-                if arg.idx >= self.analyzer.num_args:
+                if arg.idx >= self.num_args:
                     continue
                 # TODO: Change accesses value type to list.
-                accesses[arg.idx] = accesses.get(arg.idx, 0) + 1
+                accesses[arg.idx] = accesses.get(arg.idx, [])
+                accesses[arg.idx].append(1)
             elif isinstance(arg, Intermediate) and not arg.fake():
                 for op in ops[arg]:
                     if skip_loads and op.name == "tt.load":
                         continue
                     stack.extend(op.args)
+
+        return accesses
 
 
 class SymbolicFailure(Exception):
@@ -2673,12 +2704,16 @@ class SymbolicAnalyzer:
         self.sym_bounds: dict[sympy.Symbol, int] = {}
 
         self.op_handlers: dict[str, Callable] = {
+            # Leaves
             "tt.get_program_id": self._handle_program_id,
             "tt.make_range": self._handle_make_range,
             "arith.constant": self._handle_constant,
+            # Arithmetic
             "tt.addptr": self._handle_add,
             "arith.addi": self._handle_add,
             "arith.muli": self._handle_mul,
+            # TODO: Shape context handlers
+            # Passthroughs
             "tt.splat": self._handle_passthrough,
             "arith.extsi": self._handle_passthrough,
             "arith.bitcast": self._handle_passthrough,
@@ -2688,8 +2723,10 @@ class SymbolicAnalyzer:
         self,
         sink: Intermediate | Param,
         ops: dict[Intermediate, list[Op]],
-        accesses: dict[int, sympy.Expr | int],
+        accesses: dict[int, list[sympy.Expr | int]],
     ):
+        from torch._inductor.dependencies import UserTritonDep
+
         self.ops = ops
         self.accesses = accesses
         expr = self._build_expr(sink)
@@ -2708,6 +2745,19 @@ class SymbolicAnalyzer:
         local_syms = index.free_symbols
         var_names = tuple(s for s in self.sym_bounds if s in local_syms)
         sizes = tuple(self.sym_bounds[s] for s in var_names)
+
+        param_idx = int(str(ptr_sym)[1:])  # strip 'p' prefix
+        tensor_name = self.arg_names[param_idx]
+
+        accesses[param_idx] = accesses.get(param_idx, [])
+        accesses[param_idx].append(
+            UserTritonDep(
+                name=tensor_name,
+                index=index,
+                var_names=var_names,
+                size=sizes,
+            )
+        )
 
         print(f"{tensor_name=}")
         print(f"{index=}")
@@ -2755,7 +2805,7 @@ class SymbolicAnalyzer:
             self.recursion_cache[cache_key] = result
             return result
 
-            # TODO: Any error handling here?
+        # TODO: Error handling needed here?
         raise SymbolicFailure("")
 
     def _next_sym(self) -> sympy.Symbol:
@@ -2764,8 +2814,13 @@ class SymbolicAnalyzer:
         return sym
 
     def _handle_program_id(self, op: Op) -> sympy.Expr:
+        axis = op.get_int_attr("axis")
+
+        # grid may be list[TritonGridTupleType] — one per config, take first
+        grid = self.grid[0] if isinstance(self.grid, (tuple, list)) else self.grid
+        bound = grid[axis]
         sym = self._next_sym()
-        self.sym_bounds[sym] = self.grid[op.get_int_attr("axis")]
+        self.sym_bounds[sym] = bound
         return sym
 
     def _handle_make_range(self, op: Op) -> sympy.Expr:

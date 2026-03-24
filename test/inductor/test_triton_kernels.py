@@ -1152,6 +1152,7 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @inductor_config.patch("allow_buffer_reuse", True)
     def test_triton_kernel_inputs_buffer_reuse(self):
+        torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
         def _mul2(x):
             y = torch.empty_like(x)
             mul2_kernel[(10,)](
