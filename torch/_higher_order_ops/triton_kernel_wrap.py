@@ -229,6 +229,8 @@ class Op:
     # `is_pure = True` assumes the asm block has no side-effects
     is_pure: bool = False
 
+    int_attrs: dict[str, int] = dataclasses.field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if self.name == "tt.call":
             if self.fn_call_name is None:
@@ -238,6 +240,16 @@ class Op:
                 raise AssertionError(
                     f"fn_call_name must be None for non-tt.call op, got {self.fn_call_name}"
                 )
+
+    def get_int_attr(self, key: str) -> int:
+        # When calling get_int_attr we expect there to be a valid return.
+        # Raise otherwise.
+        value = self.int_attrs.get(key, None)
+        if value is None:
+            log.debug("Missing int_attr %s on op %s", key, self)
+            raise KeyError(key)
+
+        return value
 
 
 def generate_ttir(
@@ -776,7 +788,16 @@ def ttir_to_functions(
                 )
         else:
             callee = None
-            if name == "tt.call":
+            op_int_attrs = {}
+
+            if name == "tt.get_program_id":
+                op_int_attrs["axis"] = op.get_int_attr("axis")
+            elif name == "arith.constant":
+                op_int_attrs["value"] = op.get_constant_value()
+            elif name == "tt.make_range":
+                op_int_attrs["start"] = op.get_int_attr("start")
+                op_int_attrs["end"] = op.get_int_attr("end")
+            elif name == "tt.call":
                 callee = op.get_flat_symbol_ref_attr("callee")
             args: list[Param | Intermediate] = [
                 Intermediate(operand) for operand in operand_ids
@@ -791,7 +812,16 @@ def ttir_to_functions(
             if result_ids:
                 for result_id in result_ids:
                     res = Intermediate(result_id)
-                    block_ops[res].append(Op(name, callee, args, res, is_pure=is_pure))
+                    block_ops[res].append(
+                        Op(
+                            name,
+                            callee,
+                            args,
+                            res,
+                            int_attrs=op_int_attrs,
+                            is_pure=is_pure,
+                        )
+                    )
             else:
                 next_fake_intermediate -= 1
                 fake_res = Intermediate(next_fake_intermediate)
@@ -1094,6 +1124,7 @@ def identify_accessed_tensors(
     kernel: "TritonKernelType",
     kwargs: dict[str, Any],
     tma_descriptor_metadata: TMADescriptorMetadata,
+    grid: Any = None,  # FIXME
 ) -> TensorAccesses:
     """
     Given a triton kernel and the arguments for this kernel, this function
@@ -1111,6 +1142,7 @@ def identify_accessed_tensors(
         ttir_module, ordered_arg_names = generate_ttir(
             kernel, kwargs, tma_descriptor_metadata
         )
+        print(ttir_module)
 
         # extract functions from TTIR using MLIR bindings exposed by Triton code
         functions = ttir_to_functions(ttir_module)
@@ -1141,7 +1173,7 @@ def identify_accessed_tensors(
         )
 
         return KernelAccessAnalyzer(
-            functions, kernel_name, tuple(ordered_arg_names)
+            functions, kernel_name, kwargs, grid, tuple(ordered_arg_names)
         ).analyze()
 
         return analyze_kernel_access(
@@ -2407,11 +2439,15 @@ class TraceableTritonKernelWrapper:
         return arg
 
 
+# TODO: - Caching.
+#       - Move get_tma_stores here.
 class KernelAccessAnalyzer:
     def __init__(
         self,
         functions: dict[str, dict[Intermediate, list[Op]]],
         fn_name: str,
+        kwargs: dict[str, Any],
+        grid: Any,
         tensor_names: tuple[str, ...],
     ):
         self.WRITE_OPS = {
@@ -2433,14 +2469,20 @@ class KernelAccessAnalyzer:
         self.functions = functions
         self.fn_name = fn_name
         self.num_args = len(tensor_names)
+        self.kwargs = kwargs
+        self.grid = grid
         self.tensor_names = tensor_names
 
         self.write_accesses: dict[int, sympy.Expr | int] = {}
         self.read_accesses: dict[int, sympy.Expr | int] = {}
 
         import torch._inductor.config
-        self.extract_symbolic = torch._inductor.config.epilogue_fusion_user_defined_triton_kernel
-        # self.extract_symbolic = False
+
+        epilogue_fusion = (
+            torch._inductor.config.epilogue_fusion_user_defined_triton_kernel
+        )
+        self.extract_symbolic = epilogue_fusion and self.grid is not None
+        print(f"{self.extract_symbolic=} {grid=}")
         self._symbolic = SymbolicAnalyzer(self) if self.extract_symbolic else None
 
     def get_sinks(
@@ -2494,6 +2536,8 @@ class KernelAccessAnalyzer:
                     nested = KernelAccessAnalyzer(
                         self.functions,
                         fn_call_name,
+                        self.kwargs,
+                        self.grid,
                         nested_names,
                     ).analyze()
                     written_set = {dep.name for dep in nested.read_writes.writes}
@@ -2519,7 +2563,6 @@ class KernelAccessAnalyzer:
         accesses: dict[int, sympy.Expr | int],
         skip_loads: bool,
     ):
-
         # TODO: It would be nice to share recursion state, as in, continue
         # on current node during symbolic tracing, sharing the same recursion stack
         # in the even of a fallback.
@@ -2552,6 +2595,7 @@ class KernelAccessAnalyzer:
         from torch._inductor.dependencies import ReadWrites, StarDep
         from torch.utils._ordered_set import OrderedSet
 
+        # TODO: Change to MemoryDep or introduce new UserTritonDep.
         writes = OrderedSet(
             StarDep(self.tensor_names[i]) for i in sorted(self.write_accesses.keys())
         )
@@ -2597,6 +2641,7 @@ class ConservativeAnalyzer:
             if isinstance(arg, Param):
                 if arg.idx >= self.analyzer.num_args:
                     continue
+                # TODO: Change accesses value type to list.
                 accesses[arg.idx] = accesses.get(arg.idx, 0) + 1
             elif isinstance(arg, Intermediate) and not arg.fake():
                 for op in ops[arg]:
@@ -2613,9 +2658,31 @@ class SymbolicFailure(Exception):
 
 class SymbolicAnalyzer:
     def __init__(self, analyzer: KernelAccessAnalyzer):
-        self.analyzer = analyzer
+        self.kwargs = analyzer.kwargs
+        self.arg_names = analyzer.tensor_names
+        self.grid = analyzer.grid
 
-        self.op_handlers: dict[str, Callable] = {}
+        self.recursion_cache: dict[tuple, sympy.Expr] = {}
+        self.current_shape: tuple | None = None
+        self._sym_counter = 0
+
+        # See: https://docs.sympy.org/latest/explanation/best-practices
+        # Avoid subclassing sympy.Symbol, Therefore, we store param attributes
+        # externally.
+        self.param_to_tensor: dict[sympy.Symbol, Any] = {}
+        self.sym_bounds: dict[sympy.Symbol, int] = {}
+
+        self.op_handlers: dict[str, Callable] = {
+            "tt.get_program_id": self._handle_program_id,
+            "tt.make_range": self._handle_make_range,
+            "arith.constant": self._handle_constant,
+            "tt.addptr": self._handle_add,
+            "arith.addi": self._handle_add,
+            "arith.muli": self._handle_mul,
+            "tt.splat": self._handle_passthrough,
+            "arith.extsi": self._handle_passthrough,
+            "arith.bitcast": self._handle_passthrough,
+        }
 
     def traverse(
         self,
@@ -2623,21 +2690,99 @@ class SymbolicAnalyzer:
         ops: dict[Intermediate, list[Op]],
         accesses: dict[int, sympy.Expr | int],
     ):
-        raise SymbolicFailure(op.name)
         self.ops = ops
         self.accesses = accesses
-        return self._build_expr(sink)
+        expr = self._build_expr(sink)
 
-    def _build_expr(self, node: Intermediate | Param):
-        print(f"{node=} {node.idx=}")
+        # Separate the pointer symbol (p{idx}) from the index expression.
+        # The expr should be of the form: <ptr_symbol> + <index_expr>
+        # We find the single param symbol and subtract it out.
+        ptr_syms = {s for s in expr.free_symbols if s in self.param_to_tensor}
 
-        if isinstance(node, Intermediate):
+        if len(ptr_syms) != 1:
+            raise SymbolicFailure("expected exactly one pointer symbol in expr")
+
+        (ptr_sym,) = ptr_syms
+        tensor_name = self.param_to_tensor[ptr_sym]
+        index = expr - ptr_sym
+        local_syms = index.free_symbols
+        var_names = tuple(s for s in self.sym_bounds if s in local_syms)
+        sizes = tuple(self.sym_bounds[s] for s in var_names)
+
+        print(f"{tensor_name=}")
+        print(f"{index=}")
+        print(f"{local_syms=}")
+        print(f"{var_names=}")
+        print(f"{sizes=}\n")
+
+    def _build_expr(self, node: Intermediate | Param) -> sympy.Expr:
+        # TODO: - Handle Induction vars.
+        #       - Handle fake nodes.
+
+        if isinstance(node, Param):
+            param_name = self.arg_names[node.idx]
+            param_value = self.kwargs.get(param_name)
+
+            # Handle integers and floats as paramaters
+            if isinstance(param_value, int):
+                return sympy.Integer(param_value)
+            elif isinstance(param_value, float):
+                return sympy.Float(param_value)
+
+            # Else, handle a tensor
+            sym = sympy.Symbol(f"p{node.idx}")
+            self.param_to_tensor[sym] = param_name
+            return sym
+
+        elif isinstance(node, Intermediate) and not node.fake():
+            cache_key = (node.idx, self.current_shape)
+            if cache_key in self.recursion_cache:
+                return self.recursion_cache[cache_key]
+
+            # TODO: recursion cache
             op_list = self.ops.get(node)
 
             assert op_list is not None
             op = op_list[0]
             name = op.name
 
-            handler = self.op_handlers.get(op.name)
+            handler = self.op_handlers.get(name)
             if handler is None:
+                print(">" * 4 + f" need handler for {op.name}")
                 raise SymbolicFailure(op.name)
+
+            result = handler(op)
+            self.recursion_cache[cache_key] = result
+            return result
+
+            # TODO: Any error handling here?
+        raise SymbolicFailure("")
+
+    def _next_sym(self) -> sympy.Symbol:
+        sym = sympy.Symbol(f"d{self._sym_counter}")
+        self._sym_counter += 1
+        return sym
+
+    def _handle_program_id(self, op: Op) -> sympy.Expr:
+        sym = self._next_sym()
+        self.sym_bounds[sym] = self.grid[op.get_int_attr("axis")]
+        return sym
+
+    def _handle_make_range(self, op: Op) -> sympy.Expr:
+        start = op.get_int_attr("start")
+        end = op.get_int_attr("end")
+        sym = self._next_sym()
+        self.sym_bounds[sym] = end - start
+        return start + sym
+
+    def _handle_constant(self, op: Op) -> sympy.Expr:
+        return sympy.Integer(op.get_int_attr("value"))
+
+    def _handle_passthrough(self, op: Op):
+        return self._build_expr(op.args[0])
+
+    def _handle_add(self, op: Op):
+        return self._build_expr(op.args[0]) + self._build_expr(op.args[1])
+
+    def _handle_mul(self, op: Op) -> sympy.Expr:
+        return self._build_expr(op.args[0]) * self._build_expr(op.args[1])

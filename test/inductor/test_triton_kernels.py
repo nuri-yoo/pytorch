@@ -5125,6 +5125,76 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
                 compiled_f(dst, src, N=N)
 
 
+def make_kernel_access_analyzer_test(fn):
+    @requires_gpu
+    def test_fn(self):
+        from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
+
+        kernel, inputs, grid, tma_descriptor_metadata, outputs = fn()
+        tensor_accesses = identify_accessed_tensors(
+            kernel, inputs, tma_descriptor_metadata, grid
+        )
+        print(tensor_accesses)
+        mutated_tensor_names = [dep.name for dep in tensor_accesses.read_writes.writes]
+        self.assertListEqual(
+            mutated_tensor_names,
+            outputs,
+        )
+
+    return test_fn
+
+
+class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
+
+    @make_kernel_access_analyzer_test
+    def test_vec_add():
+        @triton.jit
+        def vec_add_kernel(
+            a_ptr,
+            b_ptr,
+            out_ptr,
+            BLOCK_M: tl.constexpr,
+            BLOCK_N: tl.constexpr,
+        ):
+            pid_m = tl.program_id(0)
+            pid_n = tl.program_id(1)
+
+            row_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            col_offset = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+            a_ptrs = a_ptr + row_offset
+            b_ptrs = b_ptr + col_offset
+
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            out = a + b
+
+            out_ptrs = out_ptr + row_offset
+            tl.store(out_ptrs, out)
+
+        M, N = 1024, 1024
+        BLOCK_M, BLOCK_N = 64, 64
+
+        a = torch.randn(M, device="cuda")
+        b = torch.randn(N, device="cuda")
+        out = torch.zeros(M, device="cuda")
+
+        kwargs = {
+            "a_ptr": a,
+            "b_ptr": b,
+            "out_ptr": out,
+            "BLOCK_M": BLOCK_M,
+            "BLOCK_N": BLOCK_N,
+        }
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+        return (vec_add_kernel, kwargs, grid, {}, ["out_ptr"])
+
+
 class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
     @classmethod
     def setUpClass(cls):
