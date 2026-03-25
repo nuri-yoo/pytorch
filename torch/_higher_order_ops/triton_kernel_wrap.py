@@ -217,6 +217,20 @@ class Intermediate:
         return self.idx < 0
 
 
+@dataclasses.dataclass(frozen=True)
+class InductionVar(Intermediate):
+    lb: Intermediate | Param
+    ub: Intermediate | Param
+    step: Intermediate | Param
+
+
+@dataclasses.dataclass(frozen=True)
+class IterArg(Intermediate):
+    init: Intermediate | Param
+    next: Intermediate | Param
+    iv: InductionVar
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class Op:
     name: str
@@ -664,12 +678,37 @@ def ttir_to_functions(
                         # block args: 2 (%iv, %arg)
                         # op operands: 4 (%lb, %ub, %step, %init)
                         # `%arg` is mapping to `%init`
-                        for i, idx in enumerate(block_id_to_block_arg_ids[block_id]):
-                            if i == 0:
-                                next_fake_intermediate -= 1
-                                replacements[idx] = Intermediate(next_fake_intermediate)
+
+                        block_ops_peek = op_stack.get(block_id, {})
+                        yield_args = None
+                        if block_ops_peek:
+                            _, last_ops = next(reversed(block_ops_peek.items()))
+                            if all(op.name == "scf.yield" for op in last_ops):
+                                # To account for induction variable in iter_arg:
+                                # For index i, yield.arg[i] == "next value" for iter_arg i - 1
+                                yield_args = last_ops[0].args
+
+                        block_args = block_id_to_block_arg_ids[block_id]
+                        iv_idx = block_args[0]
+                        iv = InductionVar(
+                            idx=iv_idx,
+                            lb=Intermediate(operand_ids[0]),
+                            ub=Intermediate(operand_ids[1]),
+                            step=Intermediate(operand_ids[2]),
+                        )
+                        replacements[iv_idx] = iv
+
+                        for i, idx in enumerate(block_args[1:], start=1):
+                            if yield_args is not None:
+                                replacements[idx] = IterArg(
+                                    idx=idx,
+                                    init=Intermediate(operand_ids[i + 2]),
+                                    next=yield_args[i - 1],  # corresponding yield arg
+                                    iv=iv,
+                                )
                             else:
                                 replacements[idx] = Intermediate(operand_ids[i + 2])
+
                     elif name == "scf.while":
                         # example:
                         # %3:3 = scf.while (%arg2 = %1, %arg3 = %2, %arg4 = %c0_i32_8) ...
@@ -818,15 +857,22 @@ def ttir_to_functions(
                             callee,
                             args,
                             res,
-                            int_attrs=op_int_attrs,
                             is_pure=is_pure,
+                            int_attrs=op_int_attrs,
                         )
                     )
             else:
                 next_fake_intermediate -= 1
                 fake_res = Intermediate(next_fake_intermediate)
                 block_ops[fake_res].append(
-                    Op(name, callee, args, fake_res, is_pure=is_pure)
+                    Op(
+                        name,
+                        callee,
+                        args,
+                        fake_res,
+                        is_pure=is_pure,
+                        int_attrs=op_int_attrs,
+                    )
                 )
 
     ttir_module.walk(mlir_to_functions)
@@ -1142,7 +1188,7 @@ def identify_accessed_tensors(
         ttir_module, ordered_arg_names = generate_ttir(
             kernel, kwargs, tma_descriptor_metadata
         )
-        # print(ttir_module)
+        print(ttir_module)
 
         # extract functions from TTIR using MLIR bindings exposed by Triton code
         functions = ttir_to_functions(ttir_module)
@@ -2534,13 +2580,14 @@ class KernelAccessAnalyzer:
                         )
 
                     nested_names = tuple(f"_arg{i}" for i in range(len(op.args)))
-                    nested = KernelAccessAnalyzer(
+                    nested_analyzer = KernelAccessAnalyzer(
                         self.functions,
                         fn_call_name,
                         self.kwargs,
                         self.grid,
                         nested_names,
-                    ).analyze()
+                    )
+                    nested = nested_analyzer.analyze()
                     written_set = {dep.name for dep in nested.read_writes.writes}
                     read_set = {dep.name for dep in nested.read_writes.reads}
                     for arg, name in zip(op.args, nested_names):
@@ -2587,6 +2634,8 @@ class KernelAccessAnalyzer:
                     # )
                     self.extract_symbolic = False
                     conservative.traverse(sink, ops, accesses, skip_loads)
+                    print("Exception")
+                    print(accesses)
             else:
                 conservative.traverse(sink, ops, accesses, skip_loads)
 
@@ -2672,6 +2721,10 @@ class ConservativeAnalyzer:
                 # TODO: Change accesses value type to list.
                 accesses[arg.idx] = accesses.get(arg.idx, [])
                 accesses[arg.idx].append(1)
+            elif isinstance(arg, IterArg):
+                stack.append(arg.init)
+            elif isinstance(arg, InductionVar):
+                pass
             elif isinstance(arg, Intermediate) and not arg.fake():
                 for op in ops[arg]:
                     if skip_loads and op.name == "tt.load":
@@ -2692,6 +2745,7 @@ class SymbolicAnalyzer:
         self.kwargs = analyzer.kwargs
         self.arg_names = analyzer.tensor_names
         self.grid = analyzer.grid
+        self.functions = analyzer.functions
 
         self.recursion_cache: dict[tuple, sympy.Expr] = {}
         self.current_shape: tuple | None = None
@@ -2717,6 +2771,8 @@ class SymbolicAnalyzer:
             "tt.splat": self._handle_passthrough,
             "arith.extsi": self._handle_passthrough,
             "arith.bitcast": self._handle_passthrough,
+            # Call
+            "tt.call": self._handle_call,
         }
 
     def traverse(
@@ -2769,6 +2825,8 @@ class SymbolicAnalyzer:
         # TODO: - Handle Induction vars.
         #       - Handle fake nodes.
 
+        # print(f"{type(node)=},")
+
         if isinstance(node, Param):
             param_name = self.arg_names[node.idx]
             param_value = self.kwargs.get(param_name)
@@ -2784,10 +2842,33 @@ class SymbolicAnalyzer:
             self.param_to_tensor[sym] = param_name
             return sym
 
-        elif isinstance(node, Intermediate) and not node.fake():
+        cache_key = (node.idx, self.current_shape)
+        if cache_key in self.recursion_cache:
+            return self.recursion_cache[cache_key]
+
+        if isinstance(node, IterArg):
             cache_key = (node.idx, self.current_shape)
-            if cache_key in self.recursion_cache:
-                return self.recursion_cache[cache_key]
+            # Build init and iv first — these don't reference the IterArg
+            init = self._build_expr(node.init)
+            iv = self._build_expr(node.iv)
+            # Place placeholder before recursing into next to break cycles
+            self.recursion_cache[cache_key] = init  # placeholder
+            next_expr = self._build_expr(node.next)
+            step = next_expr - init
+            result = init + iv * step
+            self.recursion_cache[cache_key] = result
+            return result
+
+        elif isinstance(node, InductionVar):
+            sym = self._next_sym()
+            lb = self._build_expr(node.lb)
+            ub = self._build_expr(node.ub)
+            step = self._build_expr(node.step)
+            self.sym_bounds[sym] = ub - lb
+            result = lb + sym * step
+
+        elif isinstance(node, Intermediate) and not node.fake():
+            print(node)
 
             # TODO: recursion cache
             op_list = self.ops.get(node)
@@ -2795,6 +2876,7 @@ class SymbolicAnalyzer:
             assert op_list is not None
             op = op_list[0]
             name = op.name
+            print(f"{name=}")
 
             handler = self.op_handlers.get(name)
             if handler is None:
@@ -2802,11 +2884,13 @@ class SymbolicAnalyzer:
                 raise SymbolicFailure(op.name)
 
             result = handler(op)
-            self.recursion_cache[cache_key] = result
-            return result
+        else:
+            # TODO: Error handling needed here?
+            print(f"Need handler for {type(node)=}")
+            raise SymbolicFailure("")
 
-        # TODO: Error handling needed here?
-        raise SymbolicFailure("")
+        self.recursion_cache[cache_key] = result
+        return result
 
     def _next_sym(self) -> sympy.Symbol:
         sym = sympy.Symbol(f"d{self._sym_counter}")
@@ -2816,7 +2900,9 @@ class SymbolicAnalyzer:
     def _handle_program_id(self, op: Op) -> sympy.Expr:
         axis = op.get_int_attr("axis")
 
-        # grid may be list[TritonGridTupleType] — one per config, take first
+        # TODO:
+        # grid may be a single TritonGridTupleType or a list[TritonGridTupleType] (one per autotuner config).
+        # If a list, take the first entry — all configs share the same grid structure.
         grid = self.grid[0] if isinstance(self.grid, (tuple, list)) else self.grid
         bound = grid[axis]
         sym = self._next_sym()
@@ -2841,3 +2927,29 @@ class SymbolicAnalyzer:
 
     def _handle_mul(self, op: Op) -> sympy.Expr:
         return self._build_expr(op.args[0]) * self._build_expr(op.args[1])
+
+    def _handle_call(self, op: Op) -> sympy.Expr:
+        func_name = op.fn_call_name
+
+        if func_name is None:
+            raise SymbolicFailure("tt.call: func_name is None")
+
+        if "cdiv" in func_name:
+            fn_ops = self.functions[func_name]
+            saved_ops = self.ops
+            self.ops = fn_ops
+            try:
+                # print(f"{fn_ops.values()=} {fn_ops=}")
+                for op_list in fn_ops.values():
+                    fn_op = op_list[0]
+                    if (
+                        fn_op.name == "tt.return"
+                        and fn_op.args
+                        and not fn_op.args[0].fake()
+                    ):
+                        return self._build_expr(fn_op.args[0])
+
+            finally:
+                self.ops = saved_ops
+
+        raise SymbolicFailure(f"tt.call: unhandled func_name ({func_name})")
