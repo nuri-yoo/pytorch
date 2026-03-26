@@ -2821,6 +2821,7 @@ class SymbolicAnalyzer:
             "arith.muli": self._handle_mul,
             "arith.divsi": self._handle_div,
             "arith.remsi": self._handle_rem,
+            "arith.minsi": self._handle_min,
             # Shape context handlers
             "tt.expand_dims": self._handle_shape_context,
             "tt.broadcast": self._handle_shape_context,
@@ -2958,9 +2959,9 @@ class SymbolicAnalyzer:
     def _get_bound(self, expr: sympy.Expr) -> int | None:
         if isinstance(expr, sympy.Integer):
             return int(expr)
-        if isinstance(expr, sympy.Symbol) and expr in self.sym_bounds:
+        elif isinstance(expr, sympy.Symbol) and expr in self.sym_bounds:
             return self.sym_bounds[expr]
-        if isinstance(expr, sympy.Mod):
+        elif isinstance(expr, sympy.Mod):
             rhs = expr.args[1]
             if isinstance(rhs, sympy.Integer):
                 return int(rhs)
@@ -3012,9 +3013,21 @@ class SymbolicAnalyzer:
         lhs = self._build_expr(op.args[0])
         rhs = self._build_expr(op.args[1])
         bound = self._get_bound(lhs)
+        return self._handle_div_exprs(lhs, rhs)
+
+    def _handle_div_exprs(self, lhs: sympy.Expr, rhs: sympy.Expr) -> sympy.Expr:
+        bound = self._get_bound(lhs)
         if bound is not None and isinstance(rhs, sympy.Integer) and bound <= int(rhs):
             return sympy.Integer(0)
         return sympy.floor(lhs / rhs)
+
+    def _handle_min(self, op: Op) -> sympy.Expr:
+        lhs = self._build_expr(op.args[0])
+        rhs = self._build_expr(op.args[1])
+        if isinstance(lhs, sympy.Integer) and isinstance(rhs, sympy.Integer):
+            return sympy.Integer(min(int(lhs), int(rhs)))
+        else:
+            return sympy.Min(lhs, rhs)
 
     def _handle_passthrough(self, op: Op):
         return self._build_expr(op.args[0])
@@ -3053,7 +3066,7 @@ class SymbolicAnalyzer:
                     if fn_op.name in ("arith.divsi", "arith.divui"):
                         dividend = self._build_expr(fn_op.args[0])
                         divisor = self._build_expr(fn_op.args[1])
-                        return dividend // divisor
+                        return self._handle_div_exprs(dividend, divisor)
             finally:
                 self.ops = saved_ops
                 self.arg_names = saved_arg_names
