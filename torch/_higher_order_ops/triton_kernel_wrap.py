@@ -275,6 +275,7 @@ class Op:
     is_pure: bool = False
 
     int_attrs: dict[str, int] = dataclasses.field(default_factory=dict)
+    list_attrs: dict[str, list] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.name == "tt.call":
@@ -290,6 +291,16 @@ class Op:
         # When calling get_int_attr we expect there to be a valid return.
         # Raise otherwise.
         value = self.int_attrs.get(key, None)
+        if value is None:
+            log.debug("Missing int_attr %s on op %s", key, self)
+            raise KeyError(key)
+
+        return value
+
+    def get_list_attr(self, key: str) -> list:
+        # When calling get_list_attr we expect there to be a valid return.
+        # Raise otherwise.
+        value = self.list_attrs.get(key, None)
         if value is None:
             log.debug("Missing int_attr %s on op %s", key, self)
             raise KeyError(key)
@@ -858,7 +869,8 @@ def ttir_to_functions(
                 )
         else:
             callee = None
-            op_int_attrs = {}
+            op_int_attrs: dict[str, int] = {}
+            op_list_attrs: dict[str, list] = {}
 
             if name == "tt.get_program_id":
                 op_int_attrs["axis"] = op.get_int_attr("axis")
@@ -869,6 +881,11 @@ def ttir_to_functions(
                 op_int_attrs["end"] = op.get_int_attr("end")
             elif name == "tt.call":
                 callee = op.get_flat_symbol_ref_attr("callee")
+            elif name in ["tt.broadcast", "tt.expand_dims", "tt.splat"]:
+                out_shape = op.get_result(0).get_shape()
+                if out_shape is not None:
+                    op_list_attrs["out_shape"] = list(out_shape)
+
             args: list[Param | Intermediate] = [
                 Intermediate(operand) for operand in operand_ids
             ]
@@ -890,6 +907,7 @@ def ttir_to_functions(
                             res,
                             is_pure=is_pure,
                             int_attrs=op_int_attrs,
+                            list_attrs=op_list_attrs,
                         )
                     )
             else:
@@ -903,6 +921,7 @@ def ttir_to_functions(
                         fake_res,
                         is_pure=is_pure,
                         int_attrs=op_int_attrs,
+                        list_attrs=op_list_attrs,
                     )
                 )
 
@@ -2518,6 +2537,8 @@ class TraceableTritonKernelWrapper:
 
 # TODO: - Caching.
 #       - Move get_tma_stores here.
+#       - Document:
+#           - op_int_attrs will raise in symbolic
 class KernelAccessAnalyzer:
     def __init__(
         self,
@@ -2658,14 +2679,14 @@ class KernelAccessAnalyzer:
             if self.extract_symbolic:
                 try:
                     self._symbolic.traverse(sink, ops, accesses)
-                except Exception:
+                except Exception as e:
                     # log.debug(
                     #     "Symbolic analysis failed at op '%s', switching to conservative",
                     #     e.op_name,
                     # )
                     self.extract_symbolic = False
                     conservative.traverse(sink, ops, accesses, skip_loads)
-                    print("Exception")
+                    print(f"Exception {e=}")
                     print(accesses)
             else:
                 conservative.traverse(sink, ops, accesses, skip_loads)
@@ -2796,11 +2817,15 @@ class SymbolicAnalyzer:
             # Arithmetic
             "tt.addptr": self._handle_add,
             "arith.addi": self._handle_add,
+            "arith.subi": self._handle_sub,
             "arith.muli": self._handle_mul,
+            "arith.divsi": self._handle_div,
+            "arith.remsi": self._handle_rem,
             # Shape context handlers
-            
+            "tt.expand_dims": self._handle_shape_context,
+            "tt.broadcast": self._handle_shape_context,
+            "tt.splat": self._handle_shape_context,
             # Passthroughs
-            "tt.splat": self._handle_passthrough,
             "arith.extsi": self._handle_passthrough,
             "arith.bitcast": self._handle_passthrough,
             # Call
@@ -2817,6 +2842,7 @@ class SymbolicAnalyzer:
 
         self.ops = ops
         self.accesses = accesses
+        self.current_shape = None
         expr = self._build_expr(sink)
 
         # Separate the pointer symbol (p{idx}) from the index expression.
@@ -2861,9 +2887,9 @@ class SymbolicAnalyzer:
             param_value = self.kwargs.get(param_name)
 
             # Handle integers and floats as paramaters
-            if isinstance(param_value, int):
+            if isinstance(param_value, (int, sympy.Integer)):
                 return sympy.Integer(param_value)
-            elif isinstance(param_value, float):
+            elif isinstance(param_value, (float, sympy.Float)):
                 return sympy.Float(param_value)
 
             # Else, handle a tensor
@@ -2929,13 +2955,27 @@ class SymbolicAnalyzer:
         self._sym_counter += 1
         return sym
 
+    def _get_bound(self, expr: sympy.Expr) -> int | None:
+        if isinstance(expr, sympy.Integer):
+            return int(expr)
+        if isinstance(expr, sympy.Symbol) and expr in self.sym_bounds:
+            return self.sym_bounds[expr]
+        if isinstance(expr, sympy.Mod):
+            rhs = expr.args[1]
+            if isinstance(rhs, sympy.Integer):
+                return int(rhs)
+        substituted = expr.subs(self.sym_bounds)
+        if isinstance(substituted, sympy.Integer):
+            return int(substituted)
+        return None
+
     def _handle_program_id(self, op: Op) -> sympy.Expr:
         axis = op.get_int_attr("axis")
 
         # TODO:
         # grid may be a single TritonGridTupleType or a list[TritonGridTupleType] (one per autotuner config).
         # If a list, take the first entry — all configs share the same grid structure.
-        grid = self.grid[0] if isinstance(self.grid, (tuple, list)) else self.grid
+        grid = self.grid[0] if isinstance(self.grid, list) else self.grid
         bound = grid[axis]
         sym = self._next_sym()
         self.sym_bounds[sym] = bound
@@ -2951,14 +2991,42 @@ class SymbolicAnalyzer:
     def _handle_constant(self, op: Op) -> sympy.Expr:
         return sympy.Integer(op.get_int_attr("value"))
 
-    def _handle_passthrough(self, op: Op):
-        return self._build_expr(op.args[0])
-
     def _handle_add(self, op: Op):
         return self._build_expr(op.args[0]) + self._build_expr(op.args[1])
 
+    def _handle_sub(self, op: Op):
+        return self._build_expr(op.args[0]) - self._build_expr(op.args[1])
+
     def _handle_mul(self, op: Op) -> sympy.Expr:
         return self._build_expr(op.args[0]) * self._build_expr(op.args[1])
+
+    def _handle_rem(self, op: Op) -> sympy.Expr:
+        lhs = self._build_expr(op.args[0])
+        rhs = self._build_expr(op.args[1])
+        bound = self._get_bound(lhs)
+        if bound is not None and isinstance(rhs, sympy.Integer) and bound <= int(rhs):
+            return lhs
+        return lhs % rhs
+
+    def _handle_div(self, op: Op) -> sympy.Expr:
+        lhs = self._build_expr(op.args[0])
+        rhs = self._build_expr(op.args[1])
+        bound = self._get_bound(lhs)
+        if bound is not None and isinstance(rhs, sympy.Integer) and bound <= int(rhs):
+            return sympy.Integer(0)
+        return sympy.floor(lhs / rhs)
+
+    def _handle_passthrough(self, op: Op):
+        return self._build_expr(op.args[0])
+
+    def _handle_shape_context(self, op: Op) -> sympy.Expr:
+        # TODO: Document
+        out_shape = op.get_list_attr("out_shape")
+        prev_shape = self.current_shape
+        self.current_shape = tuple(out_shape)
+        result = self._build_expr(op.args[0])
+        self.current_shape = prev_shape
+        return result
 
     def _handle_call(self, op: Op) -> sympy.Expr:
         func_name = op.fn_call_name
@@ -2966,22 +3034,29 @@ class SymbolicAnalyzer:
         if func_name is None:
             raise SymbolicFailure("tt.call: func_name is None")
 
-        if "cdiv" in func_name:
+        if "triton.language.standard.cdiv" in func_name:
             fn_ops = self.functions[func_name]
-            saved_ops = self.ops
+            call_args = [self._build_expr(arg) for arg in op.args]
+
+            saved_ops, saved_arg_names, saved_kwargs = (
+                self.ops,
+                self.arg_names,
+                self.kwargs,
+            )
             self.ops = fn_ops
+            self.arg_names = tuple(f"_arg{i}" for i in range(len(call_args)))
+            self.kwargs = {f"_arg{i}": v for i, v in enumerate(call_args)}
+
             try:
-                # print(f"{fn_ops.values()=} {fn_ops=}")
                 for op_list in fn_ops.values():
                     fn_op = op_list[0]
-                    if (
-                        fn_op.name == "tt.return"
-                        and fn_op.args
-                        and not fn_op.args[0].fake()
-                    ):
-                        return self._build_expr(fn_op.args[0])
-
+                    if fn_op.name in ("arith.divsi", "arith.divui"):
+                        dividend = self._build_expr(fn_op.args[0])
+                        divisor = self._build_expr(fn_op.args[1])
+                        return dividend // divisor
             finally:
                 self.ops = saved_ops
+                self.arg_names = saved_arg_names
+                self.kwargs = saved_kwargs
 
         raise SymbolicFailure(f"tt.call: unhandled func_name ({func_name})")
