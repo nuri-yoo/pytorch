@@ -1298,6 +1298,7 @@ def identify_accessed_tensors(
             for key, value in kwargs.items()
             if isinstance(value, (Tensor, TensorBox))
         ]
+        # TODO: Use UserTritonDep
         all_deps = OrderedSet(StarDep(name) for name in all_tensor_names)
         all_deps = typing.cast(OrderedSet[Dep], all_deps)
         return TensorAccesses(
@@ -2957,17 +2958,31 @@ class SymbolicAnalyzer:
         return sym
 
     def _get_bound(self, expr: sympy.Expr) -> int | None:
-        if isinstance(expr, sympy.Integer):
-            return int(expr)
-        elif isinstance(expr, sympy.Symbol) and expr in self.sym_bounds:
+        """Compute upper bound for expr, returns None otherwise.
+
+        Certain expressions expressions accumulate redudant `div`s and `rem`s
+        that can be simplified away.
+
+        An upper bound is calculated for expr, i.e. a value `B` such that
+        `expr` < `B` always. It is then the callers responsibility to check
+        B <= rhs to conclude expr < rhs, and simplify:
+          rem: sym // rhs where sym < rhs ==> 0
+          div: sym % rhs where sym < rhs ==> sym
+
+        - For plain symbols, B looked up directly.
+        - For Mod(x, k), B is k regardless of x.
+        - For composite expressions, we substitute each symbol's maximum
+            value (sym_bounds[s] - 1) and evaluate, then add 1 for B.
+        """
+        if isinstance(expr, sympy.Symbol) and expr in self.sym_bounds:
             return self.sym_bounds[expr]
         elif isinstance(expr, sympy.Mod):
             rhs = expr.args[1]
             if isinstance(rhs, sympy.Integer):
                 return int(rhs)
-        substituted = expr.subs(self.sym_bounds)
-        if isinstance(substituted, sympy.Integer):
-            return int(substituted)
+        substituted = expr.subs({s: b - 1 for s, b in self.sym_bounds.items()})
+        if isinstance(substituted, (sympy.Integer, sympy.core.numbers.Integer)):
+            return int(substituted) + 1
         return None
 
     def _handle_program_id(self, op: Op) -> sympy.Expr:
@@ -3012,7 +3027,6 @@ class SymbolicAnalyzer:
     def _handle_div(self, op: Op) -> sympy.Expr:
         lhs = self._build_expr(op.args[0])
         rhs = self._build_expr(op.args[1])
-        bound = self._get_bound(lhs)
         return self._handle_div_exprs(lhs, rhs)
 
     def _handle_div_exprs(self, lhs: sympy.Expr, rhs: sympy.Expr) -> sympy.Expr:
