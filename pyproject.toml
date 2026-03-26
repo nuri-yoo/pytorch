@@ -23,6 +23,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
+experimental = true
 build-dir = "build"
 
 [tool.scikit-build.cmake]
@@ -45,11 +46,16 @@ cmake.build-type = "RelWithDebInfo"
 # so there is a single source of truth.
 
 [tool.scikit-build.metadata.version]
-# Read wheel version from version.txt. For release builds,
-# PYTORCH_BUILD_VERSION overrides this (handled by generate_torch_version.py).
-provider = "scikit_build_core.metadata.regex"
-input = "version.txt"
-regex = "^(?P<value>.+)$"
+# Delegates to tools/generate_torch_version.py which resolves the version from
+# PYTORCH_BUILD_VERSION (release/nightly), PKG-INFO (sdist), or version.txt.
+provider = "version"
+provider-path = "tools/metadata"
+
+[tool.scikit-build.metadata.dependencies]
+# Reads PYTORCH_EXTRA_INSTALL_REQUIREMENTS env var (pipe-separated PEP 508
+# strings) to inject CUDA/ROCm/XPU pip package dependencies into the wheel.
+provider = "dependencies"
+provider-path = "tools/metadata"
 
 [tool.scikit-build.install]
 # scikit-build-core auto-strips binaries in Release builds. PyTorch needs to
@@ -141,15 +147,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
-dynamic = ["version"]
-dependencies = [
-    "filelock",
-    "typing-extensions>=4.10.0",
-    "sympy>=1.13.3",
-    "networkx>=2.5.1",
-    "jinja2",
-    "fsspec>=0.8.5",
-]
+dynamic = ["version", "dependencies"]
 
 [project.scripts]
 torchrun = "torch.distributed.run:main"
