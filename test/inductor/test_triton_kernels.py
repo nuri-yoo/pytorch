@@ -5129,6 +5129,7 @@ def make_kernel_access_analyzer_test(fn):
     """
     READS then WRITES
     """
+
     @requires_gpu
     def test_fn(self):
         from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
@@ -5161,6 +5162,8 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
 
     @make_kernel_access_analyzer_test
     def test_grouped_pid():
+        import math
+
         import sympy
 
         from torch._inductor.dependencies import UserTritonDep
@@ -5217,7 +5220,21 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
         i0, i1, i2 = sympy.symbols("i0 i1 i2")
 
         ptrs = 512 * (sympy.Mod(i0, 8) * 64 + i1) + (sympy.floor(i0 / 8) * 64 + i2)
+        read = UserTritonDep(
+            name="a_ptr",
+            index=ptrs,
+            var_names=(i0, i1, i2),
+            size=(GRID[0], BLOCK_M, BLOCK_N),
+        )
 
+        write = UserTritonDep(
+            name="b_ptr",
+            index=ptrs,
+            var_names=(i0, i1, i2),
+            size=(GRID[0], BLOCK_M, BLOCK_N),
+        )
+
+        assert math.prod(write.size) == a.numel()  # noqa: S101
         return (
             grouped_pid_kernel,
             {
@@ -5235,22 +5252,8 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
             },
             GRID,
             {},
-            [
-                UserTritonDep(
-                    name="a_ptr",
-                    index=ptrs,
-                    var_names=(i0, i1, i2),
-                    size=(GRID[0], BLOCK_M, BLOCK_N),
-                ),
-            ],
-            [
-                UserTritonDep(
-                    name="b_ptr",
-                    index=ptrs,
-                    var_names=(i0, i1, i2),
-                    size=(GRID[0], BLOCK_M, BLOCK_N),
-                ),
-            ],
+            [read],
+            [write],
         )
 
     @make_kernel_access_analyzer_test
