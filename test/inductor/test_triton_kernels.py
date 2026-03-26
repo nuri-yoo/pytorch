@@ -5130,28 +5130,108 @@ def make_kernel_access_analyzer_test(fn):
     def test_fn(self):
         from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
 
-        kernel, inputs, grid, tma_descriptor_metadata, outputs = fn()
-        tensor_accesses = identify_accessed_tensors(
-            kernel, inputs, tma_descriptor_metadata, grid
-        )
-        print(tensor_accesses)
-        mutated_tensor_names = [dep.name for dep in tensor_accesses.read_writes.writes]
-        self.assertListEqual(
-            mutated_tensor_names,
-            outputs,
-        )
+        (
+            kernel,
+            inputs,
+            grid,
+            tma_descriptor_metadata,
+            expected_reads,
+            expected_writes,
+        ) = fn()
+        ta = identify_accessed_tensors(kernel, inputs, tma_descriptor_metadata, grid)
+
+        self.assertEqual(list(ta.read_writes.writes), list(expected_writes))
+        self.assertEqual(list(ta.read_writes.reads), list(expected_reads))
 
     return test_fn
 
 
 class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
+    # - super-grouping
+    # - matmul
+    # - lint/typed + document
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
 
     @make_kernel_access_analyzer_test
+    def test_cdiv_variants():
+        import sympy
+
+        from torch._inductor.dependencies import UserTritonDep
+
+        @triton.jit
+        def cdiv_variants_kernel(
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            out_ptr,
+            N,
+            D,
+            BLOCK_SIZE: tl.constexpr,
+        ):
+            # cdiv with constexpr divisor, dynamic dividend
+            for i in range(tl.cdiv(N, BLOCK_SIZE)):
+                offsets = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < N
+                a = tl.load(a_ptr + offsets, mask=mask)
+
+            # cdiv with dynamic divisor, dynamic dividend
+            for j in range(tl.cdiv(N, D)):
+                offsets = j * D + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < N
+                b = tl.load(b_ptr + offsets, mask=mask)
+
+            # cdiv with dynamic divisor, constexpr dividend
+            for k in range(tl.cdiv(1024, D)):
+                offsets = k * D + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < N
+                c = tl.load(c_ptr + offsets, mask=mask)
+
+        t1 = torch.randn(1024, device="cuda")
+        t2 = torch.randn(1024, device="cuda")
+        t3 = torch.randn(1024, device="cuda")
+        out = torch.zeros(1024, device="cuda")
+        BLOCK_SIZE = 256
+        GRID = (1,)
+
+        i0, i1, i2, i3, i4, i5 = sympy.symbols("i0 i1 i2 i3 i4 i5")
+
+        return (
+            cdiv_variants_kernel,
+            {
+                "a_ptr": t1,
+                "b_ptr": t2,
+                "c_ptr": t3,
+                "out_ptr": out,
+                "N": 1024,
+                "D": 256,
+                "BLOCK_SIZE": BLOCK_SIZE,
+            },
+            GRID,
+            {},
+            [
+                UserTritonDep(
+                    name="a_ptr", index=i0 * 256 + i1, var_names=(i0, i1), size=(4, 256)
+                ),
+                UserTritonDep(
+                    name="b_ptr", index=i2 * 256 + i3, var_names=(i2, i3), size=(4, 256)
+                ),
+                UserTritonDep(
+                    name="c_ptr", index=i4 * 256 + i5, var_names=(i4, i5), size=(4, 256)
+                ),
+            ],
+            [],
+        )
+
+    @make_kernel_access_analyzer_test
     def test_broadcast_reshape():
+        import sympy
+
+        from torch._inductor.dependencies import UserTritonDep
+
         @triton.jit
         def broadcast_kernel(a_ptr, b_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
             for k in range(tl.cdiv(N, BLOCK_SIZE)):
@@ -5175,6 +5255,8 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
         BLOCK_SIZE = 256
         GRID = (triton.cdiv(1024, BLOCK_SIZE),)
 
+        i0, i1, i2 = sympy.symbols("i0 i1 i2")
+
         return (
             broadcast_kernel,
             {
@@ -5186,11 +5268,30 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
             },
             GRID,
             {},
-            ["out_ptr"],
+            [
+                UserTritonDep(
+                    name="a_ptr", index=i0 * 256 + i1, var_names=(i0, i1), size=(4, 256)
+                ),
+                UserTritonDep(
+                    name="b_ptr", index=i0 * 256 + i2, var_names=(i0, i2), size=(4, 256)
+                ),
+            ],
+            [
+                UserTritonDep(
+                    name="out_ptr",
+                    index=(i0 * 256 + i1) * 256 + i0 * 256 + i2,
+                    var_names=(i0, i1, i2),
+                    size=(4, 256, 256),
+                ),
+            ],
         )
 
     @make_kernel_access_analyzer_test
     def test_loop_post_ptr_add():
+        import sympy
+
+        from torch._inductor.dependencies import UserTritonDep
+
         @triton.jit
         def loop_post_ptr_add_step(
             a_ptr, b_ptr, stride, N, BLOCK_SIZE: tl.constexpr, STEP: tl.constexpr
@@ -5204,8 +5305,11 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
         t = torch.randn(1024)
         stride = 256
         BLOCK_SIZE = 256
+        N = t.numel()
         STEP = 2
         GRID = (1,)
+
+        i0, i1, i2, i3 = sympy.symbols("i0 i1 i2 i3")
 
         return (
             loop_post_ptr_add_step,
@@ -5213,17 +5317,36 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
                 "a_ptr": t,
                 "b_ptr": t,
                 "stride": stride,
-                "N": t.numel(),
+                "N": N,
                 "BLOCK_SIZE": BLOCK_SIZE,
                 "STEP": STEP,
             },
             GRID,
             {},
-            ["b_ptr"],
+            [
+                UserTritonDep(
+                    name="a_ptr",
+                    index=i2 + i3 * STEP * stride,
+                    var_names=(i2, i3),
+                    size=(256, triton.cdiv(N, BLOCK_SIZE) // STEP),
+                ),
+            ],
+            [
+                UserTritonDep(
+                    name="b_ptr",
+                    index=i0 * STEP * BLOCK_SIZE + i1,
+                    var_names=(i0, i1),
+                    size=(triton.cdiv(N, BLOCK_SIZE) // STEP, 256),
+                ),
+            ],
         )
 
     @make_kernel_access_analyzer_test
     def test_simple_loop():
+        import sympy
+
+        from torch._inductor.dependencies import UserTritonDep
+
         @triton.jit
         def simple_loop_kernel(a_ptr, b_ptr, N, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
@@ -5235,23 +5358,45 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
 
         t = torch.randn(1024)
         BLOCK_SIZE = 256
+        N = t.numel()
         GRID = (1,)
+
+        i0, i1 = sympy.symbols("i0 i1")
 
         return (
             simple_loop_kernel,
             {
                 "a_ptr": t,
                 "b_ptr": t,
-                "N": t.numel(),
+                "N": N,
                 "BLOCK_SIZE": BLOCK_SIZE,
             },
             GRID,
             {},
-            ["b_ptr"],
+            [
+                UserTritonDep(
+                    name="a_ptr",
+                    index=i0 * BLOCK_SIZE + i1,
+                    var_names=(i0, i1),
+                    size=(triton.cdiv(N, BLOCK_SIZE), BLOCK_SIZE),
+                ),
+            ],
+            [
+                UserTritonDep(
+                    name="b_ptr",
+                    index=i0 * BLOCK_SIZE + i1,
+                    var_names=(i0, i1),
+                    size=(triton.cdiv(N, BLOCK_SIZE), BLOCK_SIZE),
+                ),
+            ],
         )
 
     @make_kernel_access_analyzer_test
     def test_vec_add():
+        import sympy
+
+        from torch._inductor.dependencies import UserTritonDep
+
         @triton.jit
         def vec_add_kernel(
             a_ptr,
@@ -5278,21 +5423,48 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
 
         M, N = 1024, 1024
         BLOCK_M, BLOCK_N = 64, 64
+        GRID = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
         a = torch.randn(M, device="cuda")
         b = torch.randn(N, device="cuda")
         out = torch.zeros(M, device="cuda")
 
-        kwargs = {
-            "a_ptr": a,
-            "b_ptr": b,
-            "out_ptr": out,
-            "BLOCK_M": BLOCK_M,
-            "BLOCK_N": BLOCK_N,
-        }
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        i0, i1, i2, i3 = sympy.symbols("i0 i1 i2 i3")
 
-        return (vec_add_kernel, kwargs, grid, {}, ["out_ptr"])
+        return (
+            vec_add_kernel,
+            {
+                "a_ptr": a,
+                "b_ptr": b,
+                "out_ptr": out,
+                "BLOCK_M": BLOCK_M,
+                "BLOCK_N": BLOCK_N,
+            },
+            GRID,
+            {},
+            [
+                UserTritonDep(
+                    name="a_ptr",
+                    index=i0 * BLOCK_M + i1,
+                    var_names=(i0, i1),
+                    size=(GRID[0], BLOCK_M),
+                ),
+                UserTritonDep(
+                    name="b_ptr",
+                    index=i2 * BLOCK_N + i3,
+                    var_names=(i2, i3),
+                    size=(GRID[1], BLOCK_N),
+                ),
+            ],
+            [
+                UserTritonDep(
+                    name="out_ptr",
+                    index=i0 * BLOCK_M + i1,
+                    var_names=(i0, i1),
+                    size=(GRID[0], BLOCK_M),
+                ),
+            ],
+        )
 
 
 class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
