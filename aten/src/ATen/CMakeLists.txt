@@ -203,7 +203,9 @@ file(GLOB flash_attention_hip_hip "native/transformers/hip/flash_attn/*.hip")
 # if USE_FLASH_ATTENTION is set, ensure CK instances get generated
 if(USE_FLASH_ATTENTION)
   # Now building CK by default
-  caffe2_update_option(USE_ROCM_CK_SDPA ON)
+  if(USE_ROCM)
+    caffe2_update_option(USE_ROCM_CK_SDPA ON)
+  endif()
   if(USE_ROCM_CK_SDPA)
     if(DEFINED ENV{PYTORCH_ROCM_ARCH})
       list(LENGTH PYTORCH_ROCM_ARCH NUM_ARCHS)
