@@ -5126,6 +5126,9 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
 
 def make_kernel_access_analyzer_test(fn):
+    """
+    READS then WRITES
+    """
     @requires_gpu
     def test_fn(self):
         from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
@@ -5155,6 +5158,100 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
+
+    @make_kernel_access_analyzer_test
+    def test_grouped_pid():
+        import sympy
+
+        from torch._inductor.dependencies import UserTritonDep
+
+        @triton.jit
+        def grouped_pid_kernel(
+            a_ptr,
+            b_ptr,
+            M,
+            N,
+            stride_am,
+            stride_an,
+            stride_bm,
+            stride_bn,
+            BLOCK_M: tl.constexpr,
+            BLOCK_N: tl.constexpr,
+            GROUP_SIZE_M: tl.constexpr,
+        ):
+            pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_M)
+            num_pid_n = tl.cdiv(N, BLOCK_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+            pid_n = (pid % num_pid_in_group) // group_size_m
+
+            tl.assume(pid_m >= 0)
+            tl.assume(pid_n >= 0)
+
+            offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+            mask_m = offs_m < M
+            mask_n = offs_n < N
+
+            a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_n[None, :] * stride_an
+            a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_n[None, :])
+
+            b_ptrs = b_ptr + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn
+            tl.store(b_ptrs, a, mask=mask_m[:, None] & mask_n[None, :])
+
+        BLOCK_M, BLOCK_N, GROUP_SIZE_M = 64, 64, 8
+        M, N = 512, 512
+        a = torch.randn(M, N, device="cuda")
+        b = torch.empty(M, N, device="cuda")
+        GRID = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+        stride_am = a.stride(0)  # N = 512
+        stride_an = a.stride(1)  # 1
+        stride_bm = b.stride(0)  # N = 512
+        stride_bn = b.stride(1)  # 1
+
+        i0, i1, i2 = sympy.symbols("i0 i1 i2")
+
+        ptrs = 512 * (sympy.Mod(i0, 8) * 64 + i1) + (sympy.floor(i0 / 8) * 64 + i2)
+
+        return (
+            grouped_pid_kernel,
+            {
+                "a_ptr": a,
+                "b_ptr": b,
+                "M": M,
+                "N": N,
+                "stride_am": stride_am,
+                "stride_an": stride_an,
+                "stride_bm": stride_bm,
+                "stride_bn": stride_bn,
+                "BLOCK_M": BLOCK_M,
+                "BLOCK_N": BLOCK_N,
+                "GROUP_SIZE_M": GROUP_SIZE_M,
+            },
+            GRID,
+            {},
+            [
+                UserTritonDep(
+                    name="a_ptr",
+                    index=ptrs,
+                    var_names=(i0, i1, i2),
+                    size=(GRID[0], BLOCK_M, BLOCK_N),
+                ),
+            ],
+            [
+                UserTritonDep(
+                    name="b_ptr",
+                    index=ptrs,
+                    var_names=(i0, i1, i2),
+                    size=(GRID[0], BLOCK_M, BLOCK_N),
+                ),
+            ],
+        )
 
     @make_kernel_access_analyzer_test
     def test_cdiv_variants():
