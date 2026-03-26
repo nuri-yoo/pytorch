@@ -1152,7 +1152,6 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @inductor_config.patch("allow_buffer_reuse", True)
     def test_triton_kernel_inputs_buffer_reuse(self):
-        torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
         def _mul2(x):
             y = torch.empty_like(x)
             mul2_kernel[(10,)](
@@ -5150,6 +5149,106 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
     def setUpClass(cls):
         super().setUpClass()
         torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
+
+    @make_kernel_access_analyzer_test
+    def test_broadcast_reshape():
+        @triton.jit
+        def broadcast_kernel(a_ptr, b_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+            for k in range(tl.cdiv(N, BLOCK_SIZE)):
+                offsets = k * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < N
+
+                a = tl.load(a_ptr + offsets[:, None], mask=mask[:, None])
+                b = tl.load(b_ptr + offsets[None, :], mask=mask[None, :])
+
+                out = a + b
+
+                tl.store(
+                    out_ptr + offsets[:, None] * BLOCK_SIZE + offsets[None, :],
+                    out,
+                    mask=mask[:, None] & mask[None, :],
+                )
+
+        t1 = torch.randn(1024)
+        t2 = torch.randn(1024)
+        out = torch.randn(1024 * 1024)
+        BLOCK_SIZE = 256
+        GRID = (triton.cdiv(1024, BLOCK_SIZE),)
+
+        return (
+            broadcast_kernel,
+            {
+                "a_ptr": t1,
+                "b_ptr": t2,
+                "out_ptr": out,
+                "N": 1024,
+                "BLOCK_SIZE": BLOCK_SIZE,
+            },
+            GRID,
+            {},
+            ["out_ptr"],
+        )
+
+    @make_kernel_access_analyzer_test
+    def test_loop_post_ptr_add():
+        @triton.jit
+        def loop_post_ptr_add_step(
+            a_ptr, b_ptr, stride, N, BLOCK_SIZE: tl.constexpr, STEP: tl.constexpr
+        ):
+            ptrs = a_ptr + tl.arange(0, BLOCK_SIZE)
+            for k in range(0, tl.cdiv(N, BLOCK_SIZE), STEP):
+                a = tl.load(ptrs)
+                tl.store(b_ptr + k * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), a)
+                ptrs += stride
+
+        t = torch.randn(1024)
+        stride = 256
+        BLOCK_SIZE = 256
+        STEP = 2
+        GRID = (1,)
+
+        return (
+            loop_post_ptr_add_step,
+            {
+                "a_ptr": t,
+                "b_ptr": t,
+                "stride": stride,
+                "N": t.numel(),
+                "BLOCK_SIZE": BLOCK_SIZE,
+                "STEP": STEP,
+            },
+            GRID,
+            {},
+            ["b_ptr"],
+        )
+
+    @make_kernel_access_analyzer_test
+    def test_simple_loop():
+        @triton.jit
+        def simple_loop_kernel(a_ptr, b_ptr, N, BLOCK_SIZE: tl.constexpr):
+            pid = tl.program_id(axis=0)
+            for k in range(tl.cdiv(N, BLOCK_SIZE)):
+                offsets = k * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                mask = offsets < N
+                a = tl.load(a_ptr + offsets, mask=mask)
+                tl.store(b_ptr + offsets, a, mask=mask)
+
+        t = torch.randn(1024)
+        BLOCK_SIZE = 256
+        GRID = (1,)
+
+        return (
+            simple_loop_kernel,
+            {
+                "a_ptr": t,
+                "b_ptr": t,
+                "N": t.numel(),
+                "BLOCK_SIZE": BLOCK_SIZE,
+            },
+            GRID,
+            {},
+            ["b_ptr"],
+        )
 
     @make_kernel_access_analyzer_test
     def test_vec_add():

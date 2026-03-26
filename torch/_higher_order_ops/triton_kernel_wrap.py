@@ -224,11 +224,12 @@ class InductionVar(Intermediate):
 
     example:
     %r = scf.for %k = %1 to %2 step %3 iter_args(...) -> ... {
-    
+
     InductionVar.lb = %1
-    InductionVar.ub = %2  
+    InductionVar.ub = %2
     InductionVar.step = %3
     """
+
     lb: Intermediate | Param
     ub: Intermediate | Param
     step: Intermediate | Param
@@ -251,10 +252,11 @@ class IterArg(Intermediate):
     IterArg.next = %p3 (from yield)
     IterArg.iv = %k
 
-    NOTE: Here, IterArg replaces %p1. Upwards DFS from IterArg.next will 
+    NOTE: Here, IterArg replaces %p1. Upwards DFS from IterArg.next will
     eventually traverse back to itself (%p1), creating a cycle.
     This has to be accounted for.
     """
+
     init: Intermediate | Param
     next: Intermediate | Param
     iv: InductionVar
@@ -2795,7 +2797,8 @@ class SymbolicAnalyzer:
             "tt.addptr": self._handle_add,
             "arith.addi": self._handle_add,
             "arith.muli": self._handle_mul,
-            # TODO: Shape context handlers
+            # Shape context handlers
+            
             # Passthroughs
             "tt.splat": self._handle_passthrough,
             "arith.extsi": self._handle_passthrough,
@@ -2851,9 +2854,6 @@ class SymbolicAnalyzer:
         print(f"{sizes=}\n")
 
     def _build_expr(self, node: Intermediate | Param) -> sympy.Expr:
-        # TODO: - Handle Induction vars.
-        #       - Handle fake nodes.
-
         # print(f"{type(node)=},")
 
         if isinstance(node, Param):
@@ -2879,18 +2879,16 @@ class SymbolicAnalyzer:
             cache_key = (node.idx, self.current_shape)
             init = self._build_expr(node.init)
             iv = self._build_expr(node.iv)
-            
-            # node.next computes the updated iter_arg value using the 
+
+            # node.next computes the updated iter_arg value using the
             # current iter_arg value (this node) — e.g. %p3 = %p1 + stride
-            # where %p1 is this IterArg. Recursing into next would hit this 
+            # where %p1 is this IterArg. Recursing into next would hit this
             # IterArg again, creating a cycle. We break the cycle by caching
             # init as before recursing.
             self.recursion_cache[cache_key] = init
             next_expr = self._build_expr(node.next)
             step = next_expr - init
             result = init + iv * step
-            self.recursion_cache[cache_key] = result
-            return result
 
         elif isinstance(node, InductionVar):
             sym = self._next_sym()
@@ -2902,8 +2900,6 @@ class SymbolicAnalyzer:
 
         elif isinstance(node, Intermediate) and not node.fake():
             print(node)
-
-            # TODO: recursion cache
             op_list = self.ops.get(node)
 
             assert op_list is not None
@@ -2926,7 +2922,7 @@ class SymbolicAnalyzer:
         return result
 
     def _next_sym(self) -> sympy.Symbol:
-        # Do we want prefixes correlating to origin 
+        # Do we want prefixes correlating to origin
         # for readability.
         # For example, make_range mints "lane_0".
         sym = sympy.Symbol(f"i{self._sym_counter}")
