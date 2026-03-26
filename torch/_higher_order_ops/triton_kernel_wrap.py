@@ -2624,7 +2624,6 @@ class KernelAccessAnalyzer:
                     if op.args[0] in tma_stores:
                         write_sinks.append(op.args[1])
 
-                # TODO: test symbolic analysis on inner tt.call
                 elif op_name == "tt.call":
                     fn_call_name = op.fn_call_name
                     if fn_call_name not in self.functions:
@@ -2875,14 +2874,8 @@ class SymbolicAnalyzer:
             )
         )
 
-        print(f"{tensor_name=}")
-        print(f"{index=}")
-        print(f"{local_syms=}")
-        print(f"{var_names=}")
-        print(f"{sizes=}\n")
-
     def _build_expr(self, node: Intermediate | Param) -> sympy.Expr:
-        # print(f"{type(node)=},")
+        print(f"{type(node)=},")
 
         if isinstance(node, Param):
             param_name = self.arg_names[node.idx]
@@ -2927,7 +2920,6 @@ class SymbolicAnalyzer:
             result = lb + sym * step
 
         elif isinstance(node, Intermediate) and not node.fake():
-            print(node)
             op_list = self.ops.get(node)
 
             assert op_list is not None
