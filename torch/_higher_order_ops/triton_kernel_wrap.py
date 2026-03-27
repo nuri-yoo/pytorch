@@ -888,7 +888,7 @@ def ttir_to_functions(
                 out_shape = op.get_result(0).get_shape()
                 if out_shape is not None:
                     # get_shape() returns a list
-                    op_list_attrs["out_shape"] = tuple(out_shape) 
+                    op_list_attrs["out_shape"] = tuple(out_shape)
 
             args: list[Param | Intermediate] = [
                 Intermediate(operand) for operand in operand_ids
@@ -2559,7 +2559,7 @@ class KernelAccessAnalyzer:
         tensor_names: tuple[str, ...],
         tensor_arg_indices: frozenset[int] | None,
     ):
-        from torch._inductor.dependencies import UserTritonDep
+        from torch._inductor.dependencies import UserTritonDep  # noqa: TC001
 
         self.WRITE_OPS = {
             "tt.store": [0],
@@ -2575,7 +2575,6 @@ class KernelAccessAnalyzer:
             "tt.descriptor_load": [0],
         }
         self.UNKNOWN_OPS = {"tt.elementwise_inline_asm"}
-        self.op_handlers = {}
 
         self.functions = functions
         self.fn_name = fn_name
@@ -2637,7 +2636,7 @@ class KernelAccessAnalyzer:
 
                 elif op_name == "tt.call":
                     fn_call_name = op.fn_call_name
-                    if fn_call_name not in self.functions:
+                    if fn_call_name is None or fn_call_name not in self.functions:
                         raise AssertionError(
                             f"Function {op.fn_call_name} not found in functions dict"
                         )
@@ -2683,9 +2682,9 @@ class KernelAccessAnalyzer:
         # of failure during symbolic tracing. This would imply that the recursion
         # stack would have to be shared.
         #
-        # However, seperate stacks does prevent very unlikley stack smashes during
+        # However, separate stacks does prevent very unlikely stack smashes during
         # symbolic tracing/recursion.
-        # Seperate states also allow for simpler Param handling: symbolic tracing
+        # Separate states also allow for simpler Param handling: symbolic tracing
         # handles Sympy.expr, and conservative tracing handles access counts.
         ops = self.functions[self.fn_name]
         conservative = ConservativeAnalyzer(self.num_args, self.tensor_arg_indices)
@@ -2693,7 +2692,7 @@ class KernelAccessAnalyzer:
         for sink in sinks:
             if self.extract_symbolic:
                 try:
-                    self._symbolic.traverse(sink, ops, accesses)
+                    self._symbolic.traverse(sink, ops, accesses)  # type: ignore[union-attr]
                 except Exception as e:
                     # log.debug(
                     #     "Symbolic analysis failed at op '%s', switching to conservative",
@@ -2712,10 +2711,12 @@ class KernelAccessAnalyzer:
         self._analyze_sinks(write_sinks, self.write_accesses, skip_loads=True)
         self._analyze_sinks(read_sinks, self.read_accesses, skip_loads=False)
 
-        from torch._inductor.dependencies import ReadWrites, UserTritonDep
+        from torch._inductor.dependencies import Dep, ReadWrites, UserTritonDep
         from torch.utils._ordered_set import OrderedSet
 
         # TODO: Change to MemoryDep or introduce new UserTritonDep.
+        writes: OrderedSet[Dep]
+        reads: OrderedSet[Dep]
         if self.extract_symbolic:
             writes = OrderedSet(
                 dep
@@ -2843,7 +2844,7 @@ class SymbolicAnalyzer:
         self.param_to_tensor: dict[sympy.Symbol, Any] = {}
         self.sym_bounds: dict[sympy.Symbol, int] = {}
 
-        self.op_handlers: dict[str, Callable] = {
+        self.op_handlers: dict[str, Callable[[Op], sympy.Expr]] = {
             # Leaves
             "tt.get_program_id": self._handle_program_id,
             "tt.make_range": self._handle_make_range,
@@ -2915,7 +2916,7 @@ class SymbolicAnalyzer:
             param_name = self.arg_names[node.idx]
             param_value = self.kwargs.get(param_name)
 
-            # Handle integers and floats as paramaters
+            # Handle integers and floats as parameters
             if isinstance(param_value, (int, sympy.Integer)):
                 return sympy.Integer(param_value)
             elif isinstance(param_value, (float, sympy.Float)):
@@ -2976,8 +2977,7 @@ class SymbolicAnalyzer:
         return result
 
     def _next_sym(self) -> sympy.Symbol:
-        # Do we want prefixes correlating to origin
-        # for readability.
+        # Do we want prefixes correlating to origin for readability?
         # For example, make_range mints "lane_0".
         sym = sympy.Symbol(f"i{self._sym_counter}")
         self._sym_counter += 1
@@ -2986,7 +2986,7 @@ class SymbolicAnalyzer:
     def _get_bound(self, expr: sympy.Expr) -> int | None:
         """Compute upper bound for expr, returns None otherwise.
 
-        Certain expressions expressions accumulate redudant `div`s and `rem`s
+        Certain expressions expressions accumulate redundant `div`s and `rem`s
         that can be simplified away.
 
         An upper bound is calculated for expr, i.e. a value `B` such that
@@ -3033,10 +3033,10 @@ class SymbolicAnalyzer:
     def _handle_constant(self, op: Op) -> sympy.Expr:
         return sympy.Integer(op.get_int_attr("value"))
 
-    def _handle_add(self, op: Op):
+    def _handle_add(self, op: Op) -> sympy.Expr:
         return self._build_expr(op.args[0]) + self._build_expr(op.args[1])
 
-    def _handle_sub(self, op: Op):
+    def _handle_sub(self, op: Op) -> sympy.Expr:
         return self._build_expr(op.args[0]) - self._build_expr(op.args[1])
 
     def _handle_mul(self, op: Op) -> sympy.Expr:
@@ -3069,7 +3069,7 @@ class SymbolicAnalyzer:
         else:
             return sympy.Min(lhs, rhs)
 
-    def _handle_passthrough(self, op: Op):
+    def _handle_passthrough(self, op: Op) -> sympy.Expr:
         return self._build_expr(op.args[0])
 
     def _handle_shape_context(self, op: Op) -> sympy.Expr:

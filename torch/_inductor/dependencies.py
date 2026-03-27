@@ -74,7 +74,9 @@ class Dep(abc.ABC):
 
 @dataclasses.dataclass(frozen=True)
 class UserTritonDep(Dep):
+    # pyrefly: ignore[bad-override]
     name: str
+    # pyrefly: ignore[bad-override]
     index: sympy.Expr | None
     var_names: tuple[sympy.Symbol, ...] = ()
     size: tuple[sympy.Expr, ...] = ()
