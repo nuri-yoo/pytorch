@@ -275,7 +275,7 @@ class Op:
     is_pure: bool = False
 
     int_attrs: dict[str, int] = dataclasses.field(default_factory=dict)
-    list_attrs: dict[str, list] = dataclasses.field(default_factory=dict)
+    list_attrs: dict[str, tuple] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.name == "tt.call":
@@ -297,12 +297,12 @@ class Op:
 
         return value
 
-    def get_list_attr(self, key: str) -> list:
+    def get_list_attr(self, key: str) -> tuple:
         # When calling get_list_attr we expect there to be a valid return.
         # Raise otherwise.
         value = self.list_attrs.get(key, None)
         if value is None:
-            log.debug("Missing int_attr %s on op %s", key, self)
+            log.debug("Missing list_attr %s on op %s", key, self)
             raise KeyError(key)
 
         return value
@@ -870,8 +870,9 @@ def ttir_to_functions(
         else:
             callee = None
             op_int_attrs: dict[str, int] = {}
-            op_list_attrs: dict[str, list] = {}
+            op_list_attrs: dict[str, tuple] = {}
 
+            # Used for symbolic analysis, see SymbolicAnalyzer for usage.
             if name == "tt.get_program_id":
                 op_int_attrs["axis"] = op.get_int_attr("axis")
             elif name == "arith.constant":
@@ -881,10 +882,13 @@ def ttir_to_functions(
                 op_int_attrs["end"] = op.get_int_attr("end")
             elif name == "tt.call":
                 callee = op.get_flat_symbol_ref_attr("callee")
+
+            # Any op which changes shape attributed should go here.
             elif name in ["tt.broadcast", "tt.expand_dims", "tt.splat"]:
                 out_shape = op.get_result(0).get_shape()
                 if out_shape is not None:
-                    op_list_attrs["out_shape"] = list(out_shape)
+                    # get_shape() returns a list
+                    op_list_attrs["out_shape"] = tuple(out_shape) 
 
             args: list[Param | Intermediate] = [
                 Intermediate(operand) for operand in operand_ids
@@ -3072,7 +3076,7 @@ class SymbolicAnalyzer:
         # TODO: Document
         out_shape = op.get_list_attr("out_shape")
         prev_shape = self.current_shape
-        self.current_shape = tuple(out_shape)
+        self.current_shape = out_shape
         result = self._build_expr(op.args[0])
         self.current_shape = prev_shape
         return result
