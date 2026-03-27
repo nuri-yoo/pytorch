@@ -1269,7 +1269,12 @@ def identify_accessed_tensors(
         )
 
         return KernelAccessAnalyzer(
-            functions, kernel_name, kwargs, grid, tuple(ordered_arg_names)
+            functions,
+            kernel_name,
+            kwargs,
+            grid,
+            tuple(ordered_arg_names),
+            tensor_arg_indices,
         ).analyze()
 
         return analyze_kernel_access(
@@ -2548,6 +2553,7 @@ class KernelAccessAnalyzer:
         kwargs: dict[str, Any],
         grid: Any,
         tensor_names: tuple[str, ...],
+        tensor_arg_indices: frozenset[int] | None,
     ):
         from torch._inductor.dependencies import UserTritonDep
 
@@ -2573,6 +2579,7 @@ class KernelAccessAnalyzer:
         self.kwargs = kwargs
         self.grid = grid
         self.tensor_names = tensor_names
+        self.tensor_arg_indices = tensor_arg_indices
 
         self.write_accesses: dict[int, list[UserTritonDep | int]] = {}
         self.read_accesses: dict[int, list[UserTritonDep | int]] = {}
@@ -2632,12 +2639,16 @@ class KernelAccessAnalyzer:
                         )
 
                     nested_names = tuple(f"_arg{i}" for i in range(len(op.args)))
+
+                    # Do not pass tensor_arg_indices, most outer call of
+                    # analyze_kernel_access will filter Param nodes.
                     nested_analyzer = KernelAccessAnalyzer(
                         self.functions,
                         fn_call_name,
                         self.kwargs,
                         self.grid,
                         nested_names,
+                        None,
                     )
                     nested = nested_analyzer.analyze()
                     written_set = {dep.name for dep in nested.read_writes.writes}
@@ -2673,7 +2684,7 @@ class KernelAccessAnalyzer:
         # Seperate states also allow for simpler Param handling: symbolic tracing
         # handles Sympy.expr, and conservative tracing handles access counts.
         ops = self.functions[self.fn_name]
-        conservative = ConservativeAnalyzer(self.num_args)
+        conservative = ConservativeAnalyzer(self.num_args, self.tensor_arg_indices)
 
         for sink in sinks:
             if self.extract_symbolic:
@@ -2752,8 +2763,18 @@ class KernelAccessAnalyzer:
 
 
 class ConservativeAnalyzer:
-    def __init__(self, num_args: int):
+    def __init__(self, num_args: int, tensor_arg_indices: frozenset[int] | None):
         self.num_args = num_args
+        self.tensor_arg_indices = tensor_arg_indices
+
+        # For these ops, only the first argument (base pointer) refers to actual
+        # memory. The remaining arguments are shape/stride/offset metadata and
+        # should not be traced during mutation analysis.
+        self.POINTER_ONLY_OPS = {
+            "tt.make_tensor_ptr",
+            "tt.advance",
+            "tt.make_tensor_descriptor",
+        }
 
     def traverse(
         self,
@@ -2770,6 +2791,12 @@ class ConservativeAnalyzer:
             if isinstance(arg, Param):
                 if arg.idx >= self.num_args:
                     continue
+                if (
+                    self.tensor_arg_indices is not None
+                    and arg.idx not in self.tensor_arg_indices
+                ):
+                    continue
+
                 # TODO: Change accesses value type to list.
                 accesses[arg.idx] = accesses.get(arg.idx, [])
                 accesses[arg.idx].append(1)
@@ -2781,7 +2808,10 @@ class ConservativeAnalyzer:
                 for op in ops[arg]:
                     if skip_loads and op.name == "tt.load":
                         continue
-                    stack.extend(op.args)
+                    if op.name in self.POINTER_ONLY_OPS:
+                        stack.append(op.args[0])
+                    else:
+                        stack.extend(op.args)
 
         return accesses
 
