@@ -5151,7 +5151,8 @@ def make_kernel_access_analyzer_test(fn):
 
 
 class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
-    # - lint/typed + document
+    # - if..else
+    # - document
 
     @classmethod
     def setUpClass(cls):
@@ -5756,34 +5757,27 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
             a_ptr,
             b_ptr,
             out_ptr,
-            BLOCK_M: tl.constexpr,
-            BLOCK_N: tl.constexpr,
+            N,
+            BLOCK_SIZE: tl.constexpr,
         ):
-            pid_m = tl.program_id(0)
-            pid_n = tl.program_id(1)
+            pid = tl.program_id(0)
+            offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offset < N
 
-            row_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            col_offset = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            a = tl.load(a_ptr + offset, mask=mask)
+            b = tl.load(b_ptr + offset, mask=mask)
 
-            a_ptrs = a_ptr + row_offset
-            b_ptrs = b_ptr + col_offset
-
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
-            out = a + b
-
-            out_ptrs = out_ptr + row_offset
-            tl.store(out_ptrs, out)
+            tl.store(out_ptr + offset, a + b, mask=mask)
 
         M, N = 1024, 1024
-        BLOCK_M, BLOCK_N = 64, 64
-        GRID = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        BLOCK_SIZE = 64
+        GRID = (triton.cdiv(M, BLOCK_SIZE),)
 
         a = torch.randn(M, device="cuda")
         b = torch.randn(N, device="cuda")
         out = torch.zeros(M, device="cuda")
 
-        i0, i1, i2, i3 = sympy.symbols("i0 i1 i2 i3")
+        i0, i1 = sympy.symbols("i0 i1")
 
         return (
             vec_add_kernel,
@@ -5791,31 +5785,31 @@ class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
                 "a_ptr": a,
                 "b_ptr": b,
                 "out_ptr": out,
-                "BLOCK_M": BLOCK_M,
-                "BLOCK_N": BLOCK_N,
+                "N": N,
+                "BLOCK_SIZE": BLOCK_SIZE,
             },
             GRID,
             {},
             [
                 UserTritonDep(
                     name="a_ptr",
-                    index=i0 * BLOCK_M + i1,
+                    index=i0 * BLOCK_SIZE + i1,
                     var_names=(i0, i1),
-                    size=(GRID[0], BLOCK_M),
+                    size=(GRID[0], BLOCK_SIZE),
                 ),
                 UserTritonDep(
                     name="b_ptr",
-                    index=i2 * BLOCK_N + i3,
-                    var_names=(i2, i3),
-                    size=(GRID[1], BLOCK_N),
+                    index=i0 * BLOCK_SIZE + i1,
+                    var_names=(i0, i1),
+                    size=(GRID[0], BLOCK_SIZE),
                 ),
             ],
             [
                 UserTritonDep(
                     name="out_ptr",
-                    index=i0 * BLOCK_M + i1,
+                    index=i0 * BLOCK_SIZE + i1,
                     var_names=(i0, i1),
-                    size=(GRID[0], BLOCK_M),
+                    size=(GRID[0], BLOCK_SIZE),
                 ),
             ],
         )

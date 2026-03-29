@@ -2836,7 +2836,7 @@ class SymbolicAnalyzer:
 
         self.recursion_cache: dict[tuple, sympy.Expr] = {}
         self.current_shape: tuple | None = None
-        self._sym_counter = 0
+        self._sym_counter = itertools.count()
 
         # See: https://docs.sympy.org/latest/explanation/best-practices
         # Avoid subclassing sympy.Symbol, Therefore, we store param attributes
@@ -2979,26 +2979,27 @@ class SymbolicAnalyzer:
     def _next_sym(self) -> sympy.Symbol:
         # Do we want prefixes correlating to origin for readability?
         # For example, make_range mints "lane_0".
-        sym = sympy.Symbol(f"i{self._sym_counter}")
-        self._sym_counter += 1
+        sym = sympy.Symbol(f"i{next(self._sym_counter)}")
         return sym
 
     def _get_bound(self, expr: sympy.Expr) -> int | None:
         """Compute upper bound for expr, returns None otherwise.
 
-        Certain expressions expressions accumulate redundant `div`s and `rem`s
+        Certain expressions accumulate redundant `div`s and `rem`s
         that can be simplified away.
 
         An upper bound is calculated for expr, i.e. a value `B` such that
-        `expr` < `B` always. It is then the callers responsibility to check
-        B <= rhs to conclude expr < rhs, and simplify:
-          rem: sym // rhs where sym < rhs ==> 0
-          div: sym % rhs where sym < rhs ==> sym
+        `expr` < `B` always hold. It is then the callers responsibility to
+        perform the following simplification:
+          - arith.remsi(expr, k): if B <= k, expr % k == expr  (mod dropped)
+          - arith.divsi(expr, k): if B <= k, expr // k == 0    (div is zero)
 
-        - For plain symbols, B looked up directly.
-        - For Mod(x, k), B is k regardless of x.
-        - For composite expressions, we substitute each symbol's maximum
-            value (sym_bounds[s] - 1) and evaluate, then add 1 for B.
+        Bound derivation:
+          - Plain symbol s:   B = sym_bounds[s]
+          - Mod(x, k):        B = k  (regardless of x)
+          - Composite expr:   Substitute each symbol's maximum
+                              value (sym_bounds[s] - 1) and evaluate,
+                              then add 1 for B.
         """
         if isinstance(expr, sympy.Symbol) and expr in self.sym_bounds:
             return self.sym_bounds[expr]
@@ -3042,32 +3043,30 @@ class SymbolicAnalyzer:
     def _handle_mul(self, op: Op) -> sympy.Expr:
         return self._build_expr(op.args[0]) * self._build_expr(op.args[1])
 
-    def _handle_rem(self, op: Op) -> sympy.Expr:
-        lhs = self._build_expr(op.args[0])
-        rhs = self._build_expr(op.args[1])
-        bound = self._get_bound(lhs)
-        if bound is not None and isinstance(rhs, sympy.Integer) and bound <= int(rhs):
-            return lhs
-        return lhs % rhs
-
     def _handle_div(self, op: Op) -> sympy.Expr:
         lhs = self._build_expr(op.args[0])
         rhs = self._build_expr(op.args[1])
         return self._handle_div_exprs(lhs, rhs)
 
-    def _handle_div_exprs(self, lhs: sympy.Expr, rhs: sympy.Expr) -> sympy.Expr:
-        bound = self._get_bound(lhs)
-        if bound is not None and isinstance(rhs, sympy.Integer) and bound <= int(rhs):
-            return sympy.Integer(0)
-        return sympy.floor(lhs / rhs)
-
     def _handle_min(self, op: Op) -> sympy.Expr:
         lhs = self._build_expr(op.args[0])
         rhs = self._build_expr(op.args[1])
-        if isinstance(lhs, sympy.Integer) and isinstance(rhs, sympy.Integer):
-            return sympy.Integer(min(int(lhs), int(rhs)))
-        else:
-            return sympy.Min(lhs, rhs)
+        # NOTE: min of two sympy.Integer will fold to a constant
+        return sympy.Min(lhs, rhs)
+
+    def _handle_rem(self, op: Op) -> sympy.Expr:
+        lhs = self._build_expr(op.args[0])
+        rhs = self._build_expr(op.args[1])
+        bound = self._get_bound(lhs)
+        if bound is not None and bound <= rhs:
+            return lhs
+        return lhs % rhs
+
+    def _handle_div_exprs(self, lhs: sympy.Expr, rhs: sympy.Expr) -> sympy.Expr:
+        bound = self._get_bound(lhs)
+        if bound is not None and bound <= rhs:
+            return sympy.Integer(0)
+        return sympy.floor(lhs / rhs)
 
     def _handle_passthrough(self, op: Op) -> sympy.Expr:
         return self._build_expr(op.args[0])
