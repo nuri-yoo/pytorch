@@ -250,6 +250,7 @@ def _check_for_gradient_edge(var: VariableTracker, arg_name: str) -> None:
     Used by handle_autograd_grad to reject external GradientEdge objects that
     cannot be traced through.
     """
+    from .dicts import ConstDictVariable
     from .lists import BaseListVariable
 
     if isinstance(var, NamedTupleVariable) and var.tuple_cls is GradientEdge:
@@ -277,6 +278,17 @@ def _check_for_gradient_edge(var: VariableTracker, arg_name: str) -> None:
     elif isinstance(var, BaseListVariable):
         for i, item in enumerate(var.items):
             _check_for_gradient_edge(item, f"{arg_name}[{i}]")
+    elif isinstance(var, ConstDictVariable):
+        for hash_key, item in var.items.items():
+            if not hash_key.vt.is_python_constant():
+                unimplemented(
+                    gb_type="autograd.grad with non-constant dict key",
+                    context=f"non-constant key in {arg_name}",
+                    explanation="autograd.grad/backward dict inputs must have constant keys.",
+                    hints=[*graph_break_hints.SUPPORTABLE],
+                )
+            key_repr = hash_key.vt.as_python_constant()
+            _check_for_gradient_edge(item, f"{arg_name}[{key_repr!r}]")
 
 
 def _collect_all_grad_fns(tensor: torch.Tensor) -> set[torch.autograd.graph.Node]:
@@ -316,6 +328,7 @@ def _collect_tensors_with_sources(
     """
     from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
+    from .dicts import ConstDictVariable
     from .lazy import LazyVariableTracker
     from .lists import BaseListVariable
     from .tensor import TensorVariable
@@ -353,6 +366,9 @@ def _collect_tensors_with_sources(
         results.extend(_collect_tensors_with_sources(var.realize()))
     elif isinstance(var, BaseListVariable):
         for item in var.items:
+            results.extend(_collect_tensors_with_sources(item))
+    elif isinstance(var, ConstDictVariable):
+        for item in var.items.values():
             results.extend(_collect_tensors_with_sources(item))
     else:
         unimplemented(
@@ -2316,7 +2332,19 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                     )
                 tx.output.autograd_grad_consumed_grad_fns.update(non_leaf_consumed)
 
-            return wrap_fx_proxy(
+            # Convert dict inputs to tuple for the FX graph. The engine
+            # always operates on flat tuples; we reconstruct the dict after.
+            from .dicts import ConstDictVariable
+
+            inputs_var = args[1] if len(args) >= 2 else kwargs.get("inputs")
+            if isinstance(inputs_var, ConstDictVariable):
+                inputs_as_tuple = TupleVariable(list(inputs_var.items.values()))
+                if len(args) >= 2:
+                    args = (args[0], inputs_as_tuple, *args[2:])
+                else:
+                    kwargs = {**kwargs, "inputs": inputs_as_tuple}
+
+            result = wrap_fx_proxy(
                 tx=tx,
                 proxy=tx.output.create_proxy(
                     "call_function",
@@ -2324,6 +2352,20 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                     *proxy_args_kwargs(args, kwargs),
                 ),
             )
+
+            if isinstance(inputs_var, ConstDictVariable):
+                from .lists import BaseListVariable
+
+                assert isinstance(result, BaseListVariable)
+                items: dict[VariableTracker, VariableTracker] = dict(
+                    zip(
+                        inputs_var.items.keys(),
+                        result.items,
+                        strict=True,
+                    )
+                )
+                return ConstDictVariable(items, dict)
+            return result
 
         return handlers
 
