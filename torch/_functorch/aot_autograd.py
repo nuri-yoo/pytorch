@@ -24,7 +24,6 @@ from torch._dynamo.utils import (
     preserve_rng_state,
     set_feature_use,
 )
-from torch._functorch._aot_autograd.autograd_cache import create_fx_config
 from torch._guards import detect_fake_mode
 from torch._inductor.codecache import resolve_pre_grad_pass_timing
 from torch._subclasses import FakeTensor, FakeTensorMode
@@ -157,9 +156,9 @@ from .partitioners import default_partition
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
-    from torch._inductor.cudagraph_utils import BoxedDeviceIndex
+    from torch._inductor.compile_fx import CompilerConfigExtra
     from torch._inductor.output_code import OutputCode
-    from torch._inductor.utils import BoxedBool, InputType
+    from torch._inductor.utils import InputType
     from torch._ops import OpOverload
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -1047,8 +1046,7 @@ def aot_module_simplified(
     inference_compiler: AOTDispatchCompiler | None = None,
     # TODO: This doesn't seem to be used in any nontrivial way, check if it's
     # actually needed
-    cudagraphs: BoxedBool | None = None,
-    boxed_forward_device_index: BoxedDeviceIndex | None = None,
+    compiler_config_extra: CompilerConfigExtra | None = None,
     ignore_shape_env: bool = False,
     disable_functionalization: bool = False,
     # Optional callback to run passes on the module at the start of AOT autograd.
@@ -1112,12 +1110,11 @@ def aot_module_simplified(
             remote = should_use_remote_autograd_cache()
             if local or remote:
                 set_feature_use("aot_autograd_remote_cache", remote)
-                fx_config = create_fx_config(cudagraphs, boxed_forward_device_index)
                 compiled_fn = AOTAutogradCache.try_load(
                     mod,
                     fake_flat_args,
                     aot_config,
-                    fx_config,
+                    compiler_config_extra,
                     local,
                     remote,
                 )
