@@ -23,13 +23,14 @@ def _rocm_include_paths(dst_file_ext: str) -> list[str]:
 
         ck_path = parutil.get_dir_path("composable-kernel-headers")
     else:
-        if not config.rocm.ck_dir:
-            ck_dir, _, _, _ = try_import_ck_lib()
-            if not ck_dir:
-                log.warning("Unspecified Composable Kernel directory")
-            config.rocm.ck_dir = ck_dir
-        ck_path = config.rocm.ck_dir or cpp_extension._join_rocm_home(
-            "composable_kernel"
+        # TORCHINDUCTOR_CK_DIR takes priority to allow testing different ck4inductor
+        # versions without reinstalling. This is checked before config.rocm.ck_dir
+        # because config.patch() in tests may override the config value.
+        ck_path = (
+            os.environ.get("TORCHINDUCTOR_CK_DIR")
+            or config.rocm.ck_dir
+            or try_import_ck_lib()[0]
+            or cpp_extension._join_rocm_home("composable_kernel")
         )
 
     log.debug("Using ck path %s", ck_path)
