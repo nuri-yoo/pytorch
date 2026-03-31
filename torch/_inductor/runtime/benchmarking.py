@@ -13,7 +13,6 @@ import torch._inductor.config as inductor_config
 import torch.utils._pytree as pytree
 from torch._dynamo.utils import counters
 from torch.utils._debug_mode import DebugMode
-from torch.utils._ordered_set import OrderedSet
 
 
 logger = torch._logging.getArtifactLogger(__name__, "benchmarking")
@@ -598,26 +597,20 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
         _callable()
         torch.cuda.synchronize()
 
-        # create cache flush buffer: 256 MB = 256 * 1024 * 1024 bytes
-        # NOTE: This is the same buffer size as Triton's do_bench
-        # For AMD, there are better outcomes on short duration kernels (<20 us)
-        # when buffer size is set to the Infinity cache (LLC) instead of L2.
-        # LLC cache size is not a supported field in PyTorch device properties.
+        # Keep Triton's 256 MB cache flush on ROCm. On other backends, reuse
+        # the shared L2-sized flush from InductorBenchmarker.
         # see https://github.com/triton-lang/triton/pull/840 for why `dtype=torch.int`
-        buffer_size_bytes = 256 * 1024 * 1024
+        if torch.version.hip:
+            buffer_size_bytes = 256 * 1024 * 1024
+        else:
+            buffer_size_bytes = self.L2_cache_size
         buffer = torch.empty(buffer_size_bytes // 4, dtype=torch.int, device="cuda")
         buffer.zero_()
 
         # Estimation phase with separate event pairs — also serves as warmup.
         # Using per-iteration event pairs lets us take the min, matching
         # InductorBenchmarker's approach for a more robust estimate.
-        event_pairs = [
-            (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            for _ in range(estimation_iters)
-        ]
+        event_pairs = self.get_event_pairs(estimation_iters)
         for start_event, end_event in event_pairs:
             if grad_to_none is not None:
                 for x in grad_to_none:
@@ -627,10 +620,7 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
             _callable()
             end_event.record()
         torch.cuda.synchronize()
-        estimated_ms = min(
-            start_event.elapsed_time(end_event)
-            for start_event, end_event in event_pairs
-        )
+        estimated_ms = self.get_event_pairs_min_timing(event_pairs)
         if estimated_ms > 0:
             rep = max(min(rep, int(max_benchmark_duration / estimated_ms)), 1)
 
@@ -682,47 +672,33 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
             "not produce a GPU_USER_ANNOTATION profiler event."
         )
 
-        # On HIP/ROCm, Triton kernels launch via hipModuleLaunchKernel (module
-        # API) while built-in ops like buffer.zero_() use hipLaunchKernel
-        # (runtime API), so filtering by _launch_kernel_keys naturally scopes
-        # to just the Triton kernel launches inside _CALLABLE.
-        # On CUDA this does NOT work reliably:
-        #   - If CUPTI driver API tracing is off (likely the default),
-        #     cuLaunchKernel events are absent and launch overhead is 0.
-        #   - If driver API tracing is on, cuLaunchKernel captures ALL launches
-        #     (including buffer.zero_()) because the runtime API calls through
-        #     to the driver API, breaking the scoping.
-        if inductor_config.triton.cudagraphs:
-            callable_time_launch_overhead_us = 0
-        else:
-            _launch_overhead_keys = OrderedSet(
-                [
-                    "hipModuleLaunchKernel",
-                    "hipExtModuleLaunchKernel",
-                    "cuLaunchKernel",
-                    "cuLaunchKernelEx",
-                    "hipMemcpyAsync",
-                    "cudaMemcpyAsync",
-                    "cuMemcpyAsync",
-                    "cuMemcpyDtoD",
-                    "cuMemcpyDtoDAsync",
-                ]
-            )
-            callable_time_launch_overhead_us = sum(
-                event.cpu_time_total
-                for event in prof.key_averages()
-                if event.device_type == torch.profiler.DeviceType.CPU
-                and event.key in _launch_overhead_keys
-            )
-
-        # temporary hack, we set callable_time_launch_overheard_us to zero
-        callable_time_launch_overhead_us = 0
-
-        # GPU execution and CPU launch happen on overlapping timelines (the
-        # CPU launches asynchronously while the GPU executes), so adding them
-        # would double-count. Taking the max gives the true bottleneck: GPU
-        # time when GPU-bound, or launch overhead when launch-bound.
-        total_time_us = max(callable_gpu_time_us, callable_time_launch_overhead_us)
+        # This launch-overhead aggregation was an experiment to better align
+        # profiler timings with event-based timings, but it has not been robust
+        # enough in practice and warrants further investigation before reuse.
+        #
+        # if inductor_config.triton.cudagraphs:
+        #     callable_time_launch_overhead_us = 0
+        # else:
+        #     _launch_overhead_keys = (
+        #         "hipModuleLaunchKernel",
+        #         "hipExtModuleLaunchKernel",
+        #         "cuLaunchKernel",
+        #         "cuLaunchKernelEx",
+        #         "hipMemcpyAsync",
+        #         "cudaMemcpyAsync",
+        #         "cuMemcpyAsync",
+        #         "cuMemcpyDtoD",
+        #         "cuMemcpyDtoDAsync",
+        #     )
+        #     callable_time_launch_overhead_us = sum(
+        #         event.cpu_time_total
+        #         for event in prof.key_averages()
+        #         if event.device_type == torch.profiler.DeviceType.CPU
+        #         and event.key in _launch_overhead_keys
+        #     )
+        #
+        # total_time_us = max(callable_gpu_time_us, callable_time_launch_overhead_us)
+        total_time_us = callable_gpu_time_us
         avg_time_ms = (total_time_us / rep) / 1000.0
 
         # explicitly delete the buffer, sometimes helps memory
