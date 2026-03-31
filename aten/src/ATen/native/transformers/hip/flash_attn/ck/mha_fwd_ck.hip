@@ -6,6 +6,72 @@
 #include <fmha_fwd.hpp>
 #include <mask.hpp>
 
+#include <cstdio>
+
+namespace {
+
+const char* mask_enum_str(mask_enum m) {
+    switch (m) {
+        case mask_enum::no_mask:          return "no_mask";
+        case mask_enum::mask_top_left:    return "mask_top_left";
+        case mask_enum::mask_bottom_right:return "mask_bottom_right";
+        case mask_enum::window_generic:   return "window_generic";
+        default:                          return "unknown";
+    }
+}
+
+const char* bias_enum_str(bias_enum b) {
+    switch (b) {
+        case bias_enum::no_bias:          return "no_bias";
+        case bias_enum::elementwise_bias: return "elementwise_bias";
+        case bias_enum::alibi:            return "alibi";
+        default:                          return "unknown";
+    }
+}
+
+const char* qscale_enum_str(quant_scale_enum q) {
+    switch (q) {
+        case quant_scale_enum::no_scale:      return "no_scale";
+        case quant_scale_enum::pertensor:      return "pertensor";
+        case quant_scale_enum::blockscale:     return "blockscale";
+        case quant_scale_enum::kv_blockscale:  return "kv_blockscale";
+        default:                               return "unknown";
+    }
+}
+
+void dump_fmha_fwd_kernel_selection_params(const fmha_fwd_traits& t,
+                                           const fmha_fwd_args& a) {
+    std::printf("=== fmha_fwd kernel selection params ===\n");
+    std::printf("--- traits ---\n");
+    std::printf("  data_type          : %s\n",  t.data_type.c_str());
+    std::printf("  hdim_q             : %d\n",  t.hdim_q);
+    std::printf("  hdim_v             : %d\n",  t.hdim_v);
+    std::printf("  is_group_mode      : %s\n",  t.is_group_mode      ? "true" : "false");
+    std::printf("  is_v_rowmajor      : %s\n",  t.is_v_rowmajor      ? "true" : "false");
+    std::printf("  has_logits_soft_cap: %s\n",  t.has_logits_soft_cap ? "true" : "false");
+    std::printf("  mask_type          : %s (%d)\n", mask_enum_str(t.mask_type),
+                static_cast<int>(t.mask_type));
+    std::printf("  bias_type          : %s (%d)\n", bias_enum_str(t.bias_type),
+                static_cast<int>(t.bias_type));
+    std::printf("  has_lse            : %s\n",  t.has_lse             ? "true" : "false");
+    std::printf("  has_dropout        : %s\n",  t.has_dropout         ? "true" : "false");
+    std::printf("  qscale_type        : %s (%d)\n", qscale_enum_str(t.qscale_type),
+                static_cast<int>(t.qscale_type));
+    std::printf("  skip_min_seqlen_q  : %s\n",  t.skip_min_seqlen_q  ? "true" : "false");
+    std::printf("  has_sink           : %s\n",  t.has_sink            ? "true" : "false");
+    std::printf("--- args ---\n");
+    std::printf("  hdim_q             : %d\n",  static_cast<int>(a.hdim_q));
+    std::printf("  hdim_v             : %d\n",  static_cast<int>(a.hdim_v));
+    std::printf("  seqlen_k           : %d\n",  static_cast<int>(a.seqlen_k));
+    std::printf("  cu_seqlen_k_ptr    : %p\n",  a.cu_seqlen_k_ptr);
+    std::printf("  batch              : %d\n",  static_cast<int>(a.batch));
+    std::printf("  nhead_q            : %d\n",  static_cast<int>(a.nhead_q));
+    std::printf("  max_seqlen_q       : %d\n",  static_cast<int>(a.max_seqlen_q));
+    std::printf("========================================\n");
+    std::fflush(stdout);
+}
+
+} // anonymous namespace
 
 namespace pytorch_flash {
 
