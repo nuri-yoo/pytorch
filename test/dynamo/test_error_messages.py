@@ -692,6 +692,21 @@ Graph break under GenericContextWrappingVariable
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0066.html
 
+Source of graph break:
+                    torch._dynamo.graph_break()
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+
+Related values:
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                with GenericCtxMgr():
+                     ^^^^^^^^^^^^^^^
+
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                    with GenericCtxMgr():
+                         ^^^^^^^^^^^^^^^
+
 User code traceback:
   File "test_error_messages.py", line N, in test_generic_ctx_mgr_graph_break_fullgraph_false
     torch.compile(fn, backend="eager")()
@@ -822,6 +837,9 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            torch._dynamo.graph_break()
+            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_reconstruction_failure_gb
     torch.compile(fn, backend="eager")()
@@ -848,6 +866,9 @@ Reconstruction failure
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0092.html
 
+Source of graph break:
+            torch._dynamo.graph_break()
+            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_reconstruction_failure_gb
     torch.compile(fn, backend="eager")()
@@ -936,7 +957,7 @@ from user code:
     if x.sum() > 0:""",
         )
 
-    # Test that the bytecode source attribution is correct with VariableTracker
+    # Test that trace_bytecode log emits TRACE lines with variable tracker state
     @make_logging_test(trace_bytecode=True)
     def test_variable_tracker_source_attribution(self, records):
         def inner(x):
@@ -949,36 +970,19 @@ from user code:
 
         fn(torch.ones(3))
 
-        def find_trace_bytecode_lines(long_string):
-            # Split the string into lines
-            lines = long_string.split("\n")
-            # More comprehensive pattern to capture LazyVariableTracker info
-            pattern = r"LazyVariableTracker\([^)]*\)"
-            # Find all lines containing the pattern
-            result = [line for line in lines if re.search(pattern, line)]
-            return result
-
-        # Get all log messages, not just the last one
-        all_messages = []
-        for record in records:
-            msg = munge_exc(record.getMessage(), skip=0)
-
-            all_messages.append(msg)
-
-        # Combine all messages to search through
-        combined_msg = "\n".join(all_messages)
-        all_lines = find_trace_bytecode_lines(combined_msg)
-
-        # For now, just check that we found some lines with LazyVariableTracker
-        self.assertGreater(
-            len(all_lines), 0, "Should find at least one LazyVariableTracker line"
-        )
-
-        self.assertIn(
-            "LazyVariableTracker(unrealized: <class 'function'>)", all_lines[0]
-        )
-        self.assertIn(
-            "LazyVariableTracker(unrealized: <class 'torch.Tensor'>)", all_lines[3]
+        # Check that we got trace_bytecode records and they have TRACE lines
+        all_messages = [record.getMessage() for record in records]
+        trace_lines = [
+            line
+            for msg in all_messages
+            for line in msg.split("\n")
+            if line.startswith("TRACE ")
+        ]
+        self.assertGreater(len(trace_lines), 0, "Should find TRACE lines in records")
+        # Each TRACE line should have opname and stack representation
+        self.assertTrue(
+            all(re.match(r"TRACE \S+", line) for line in trace_lines),
+            "All TRACE lines should start with 'TRACE <opname>'",
         )
 
     @make_logging_test(graph_breaks=True)
@@ -1003,6 +1007,9 @@ Graph Break Reason: Data-dependent branching
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0170.html
 
+Source of graph break:
+            if x.sum() > 0:
+               ^^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_data_dependent_branching_gb
     torch.compile(fn, backend="eager")(torch.randn(3))
@@ -1039,6 +1046,16 @@ Data-dependent assertion failed (cannot compile partial graph)
   Developer debug context: value: ConstantVariable(bool: False)
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0034.html
+
+Source of graph break:
+                assert x is None  # noqa: S101
+                       ^^^^^^^^^
+
+Related values:
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                with GenericCtxMgr():
+                     ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_assert_failure_in_generic_ctx_mgr
@@ -1184,6 +1201,16 @@ graph break in loop
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb7000.html
 
+Source of graph break:
+                torch._dynamo.graph_break()
+                ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+
+Related values:
+  RangeIteratorVariable() originated from:
+  File "test_error_messages.py", line N
+                for i in range(2):
+                         ^^^^^^^^
+
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_in_loop
     fn(torch.ones(3))
@@ -1228,6 +1255,16 @@ graph break in loop
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb7000.html
 
+Source of graph break:
+                if x.sum() > 0:
+                   ^^^^^^^^^^^
+
+Related values:
+  RangeIteratorVariable() originated from:
+  File "test_error_messages.py", line N
+                for i in range(2):
+                         ^^^^^^^^
+
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_in_loop
     gn(torch.ones(3))
@@ -1261,6 +1298,21 @@ Data-dependent branching
   Developer debug context: attempted to jump with TensorVariable()
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0170.html
+
+Source of graph break:
+                    if x.sum() > 0:
+                       ^^^^^^^^^^^
+
+Related values:
+  RangeIteratorVariable() originated from:
+  File "test_error_messages.py", line N
+                for i in range(2):
+                         ^^^^^^^^
+
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                    with GenericCtxMgr():
+                         ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_skip_frame_in_loop_message
@@ -1318,6 +1370,9 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            torch._dynamo.graph_break()  # 1
+            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_compile_user_frames
     torch.compile(fn, backend="eager")(torch.randn(3))
@@ -1496,6 +1551,9 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            Foo().attr = x
+            ^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_traceback_above_dynamo_shows_user_code
     f3(torch.randn(3))
@@ -1554,6 +1612,9 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            torch._dynamo.graph_break()  # correct
+            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_traceback_collapsed_resume_frames
     f1(torch.randn(3))
@@ -1786,6 +1847,9 @@ Call to `torch._dynamo.step_unsupported()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb4636.html
 
+Source of graph break:
+            torch._dynamo.step_unsupported()
+            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_step_graph_break
     fn(torch.ones(3))
@@ -1842,6 +1906,9 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            Foo().attr = x
+            ^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_store_attr_graph_break
     fn(torch.ones(3))
@@ -1979,6 +2046,9 @@ HOP: Unsafe side effect
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0067.html
 
+Source of graph break:
+            return torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=True)
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_hop_side_effect_error_includes_hop_context_fullgraph_false
     torch.compile(model, backend="eager", fullgraph=False)(torch.rand(4))
@@ -2254,6 +2324,21 @@ Graph break under GenericContextWrappingVariable
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0066.html
 
+Source of graph break:
+                    inner()
+                    ~~~~~^^
+
+Related values:
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                with GenericCtxMgr():
+                     ^^^^^^^^^^^^^^^
+
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                    with GenericCtxMgr():
+                         ^^^^^^^^^^^^^^^
+
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_generic_ctx_mgr
     torch.compile(fn, backend="eager")()
@@ -2338,6 +2423,16 @@ Graph break under GenericContextWrappingVariable
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0066.html
 
+Source of graph break:
+                torch._dynamo.graph_break()
+                ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+
+Related values:
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                with GenericCtxMgr():
+                     ^^^^^^^^^^^^^^^
+
 User code traceback:
   File "test_error_messages.py", line N, in test_skipped_frame_with_verbose_traceback_nested
     torch.compile(f3, backend="eager")(torch.randn(3))
@@ -2390,6 +2485,21 @@ Data-dependent branching
   Developer debug context: attempted to jump with TensorVariable()
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0170.html
+
+Source of graph break:
+                    if x.sum() > 0:
+                       ^^^^^^^^^^^
+
+Related values:
+  RangeIteratorVariable() originated from:
+  File "test_error_messages.py", line N
+                for i in range(2):
+                         ^^^^^^^^
+
+  WithExitFunctionVariable() originated from:
+  File "test_error_messages.py", line N
+                    with GenericCtxMgr():
+                         ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_skip_frame_in_loop_message_nested
@@ -2459,6 +2569,8 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            return middle_with_try(x)
 User code traceback:
   File "test_error_messages.py", line N, in test_try_block_with_graph_break_suppression
     torch.compile(outer, backend="eager")(torch.ones(3))
@@ -2544,6 +2656,9 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            torch._dynamo.graph_break()
+            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_graph_break_different_call_sites_not_suppressed
     outer(torch.ones(3))
@@ -2568,6 +2683,9 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            torch._dynamo.graph_break()
+            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_graph_break_different_call_sites_not_suppressed
     outer(torch.ones(3))

@@ -4682,6 +4682,8 @@ def get_instruction_source_311(code: types.CodeType, inst: Instruction) -> str:
             for lineno in range(inst.positions.lineno, inst.positions.end_lineno + 1)
         ]
         orig_lines_dedent = textwrap.dedent("\n".join(orig_lines)).splitlines()
+        if not orig_lines_dedent:
+            return result
         indent_len = len(orig_lines[0]) - len(orig_lines_dedent[0])
         indent = orig_lines[0][:indent_len]
         result = textwrap.indent(textwrap.dedent(result), indent)
