@@ -4,7 +4,7 @@ if "%DEBUG%" == "1" (
   set BUILD_TYPE=release
 )
 
-set PATH=C:\Program Files\CMake\bin;C:\Program Files\7-Zip;C:\ProgramData\chocolatey\bin;C:\Program Files\Git\cmd;C:\Program Files\Amazon\AWSCLI;C:\Program Files\Amazon\AWSCLI\bin;%PATH%
+set PATH=C:\Program Files\7-Zip;C:\ProgramData\chocolatey\bin;C:\Program Files\Git\cmd;C:\Program Files\Amazon\AWSCLI;C:\Program Files\Amazon\AWSCLI\bin;%PATH%
 
 :: This inflates our log size slightly, but it is REALLY useful to be
 :: able to see what our cl.exe commands are (since you can actually
@@ -37,11 +37,8 @@ call %INSTALLER_DIR%\activate_miniconda3.bat
 if errorlevel 1 goto fail
 if not errorlevel 0 goto fail
 
-:: Update CMake
-:: TODO: Investigate why this helps MKL detection, even when CMake from choco is not used
-call choco upgrade -y cmake --no-progress --installargs 'ADD_CMAKE_TO_PATH=System' --apply-install-arguments-to-dependencies --version=3.27.9
-if errorlevel 1 goto fail
-if not errorlevel 0 goto fail
+:: cmake is installed via pip (requirements-ci.txt) and available on PATH
+:: after conda activation. No need for Chocolatey cmake.
 
 :: TODO: Move to .ci/docker/requirements-ci.txt
 call pip install mkl==2024.2.0 mkl-static==2024.2.0 mkl-include==2024.2.0
@@ -96,7 +93,7 @@ set PATH=%CUDA_PATH%\bin;%CUDA_PATH%\libnvvp;%PATH%
 :cuda_build_end
 
 set DISTUTILS_USE_SDK=1
-set PATH=%TMP_DIR_WIN%\bin;C:\Program Files\CMake\bin;%PATH%
+set PATH=%TMP_DIR_WIN%\bin;%PATH%
 
 :: The latest Windows CUDA test is running on AWS G5 runner with A10G GPU
 if "%TORCH_CUDA_ARCH_LIST%" == "" set TORCH_CUDA_ARCH_LIST=8.6
