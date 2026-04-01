@@ -735,12 +735,6 @@ def foreach_max_strategy(op_schema: OpSchema) -> TupleStrategy:
         aten.tril.default,
         aten.triu.default,
         aten._linalg_eigh.default,
-        aten.upsample_bicubic2d.default,
-        aten.upsample_bilinear2d.default,
-        aten.upsample_linear1d.default,
-        aten.upsample_nearest2d.default,
-        aten.upsample_trilinear3d.default,
-        # TODO: support the full F.interpolate set of options.
     ],
     schema_info=RuntimeSchemaInfo(1),
 )
@@ -1876,3 +1870,128 @@ def linalg_cross_strategy(
             continue
         strategies.append([_ShardingPlaceholder(dim)] * 3)
     return strategies
+
+
+# ---------------------------------------------------------------------------
+# Interpolation / upsample / pooling ops
+#
+# These ops operate on spatial dims and are safely shardable on batch (dim 0)
+# and channel (dim 1). grid_sampler is batch-only because the grid tensor has
+# no channel dimension.
+# ---------------------------------------------------------------------------
+
+
+@register_single_dim_strategy(
+    [
+        aten.upsample_nearest1d.default,
+        aten.upsample_nearest2d.default,
+        aten.upsample_nearest3d.default,
+        aten._upsample_nearest_exact1d.default,
+        aten._upsample_nearest_exact2d.default,
+        aten._upsample_nearest_exact3d.default,
+        aten._upsample_bilinear2d_aa.default,
+        aten.upsample_bicubic2d.default,
+        aten.upsample_bilinear2d.default,
+        aten.upsample_linear1d.default,
+        aten.upsample_trilinear3d.default,
+    ],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def interp_upsample_1out_1in_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # 1 output + 1 input = 2 placements; shard on batch (0) and channel (1)
+    # Upsample is a linear transformation so Partial(sum/avg) is valid.
+    return [
+        [_ShardingPlaceholder(0)] * 2,
+        [_ShardingPlaceholder(1)] * 2,
+        [Partial(), Partial()],
+        [Partial("avg"), Partial("avg")],
+    ]
+
+
+@register_single_dim_strategy(
+    [
+        aten.max_unpool2d.default,
+        aten.max_unpool3d.default,
+        aten._adaptive_avg_pool2d_backward.default,
+    ],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def interp_pool_1out_2in_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # 1 output + 2 inputs = 3 placements; shard on batch (0) and channel (1)
+    return [
+        [_ShardingPlaceholder(0)] * 3,
+        [_ShardingPlaceholder(1)] * 3,
+    ]
+
+
+@register_op_strategy(
+    [aten.max_pool2d_with_indices_backward.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def pool_backward_strategy(op_schema: OpSchema) -> OpStrategy:
+    # max_pool2d_with_indices_backward(grad_output, self, ..., indices) -> grad_input
+    # `self` is only used for output shape; `indices` drives the scatter so it
+    # must be identical on all ranks (Replicate).  The backward is a pure
+    # selection from grad_output, so Partial(sum/avg/max/min) all pass through.
+    input_strategy = cast(OpStrategy, op_schema.args_schema[0])
+    mesh = input_strategy.mesh
+    # n = 1 output + 3 tensor inputs
+    n = 4
+    single_mesh_dim_strategies: list[PlacementList] = [
+        [Replicate()] * n,
+        [Shard(0)] * n,
+    ]
+    is_batched = input_strategy.ndim >= 4  # (N, C, H, W)
+    if is_batched:
+        single_mesh_dim_strategies.append([Shard(1)] * n)
+    # The backward is linear in grad_output, so P(sum/avg) pass through.
+    # indices must be replicated (integer positions, not reducible).
+    # self is only used for shape, so replicate it too.
+    # Order: [output, grad_output, self, indices]
+    r = Replicate()
+    for reduce_op in ("sum", "avg"):
+        p = Partial(reduce_op)
+        single_mesh_dim_strategies.append([p, p, r, r])
+    return expand_to_full_mesh_op_strategy(
+        mesh, op_schema, single_mesh_dim_strategies, input_index=1
+    )
+
+
+@register_single_dim_strategy(
+    [aten.grid_sampler_2d.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def grid_sampler_2d_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # grid_sampler_2d(input[N,C,H,W], grid[N,H_out,W_out,2]) -> output[N,C,H_out,W_out]
+    # grid has no channel dim, so only batch sharding applies to both inputs.
+    # Linear in input: P(sum/avg) on input with replicated grid is valid.
+    return [
+        [_ShardingPlaceholder(0)] * 3,
+        [Partial(), Partial(), Replicate()],
+        [Partial("avg"), Partial("avg"), Replicate()],
+    ]
+
+
+@register_single_dim_strategy(
+    [aten.grid_sampler_2d_backward.default],
+    schema_info=RuntimeSchemaInfo(1),
+)
+def grid_sampler_2d_backward_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    # 2 outputs (grad_input, grad_grid) + 3 inputs = 5 placements, batch-only
+    return [[_ShardingPlaceholder(0)] * 5]
