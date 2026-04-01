@@ -2119,25 +2119,61 @@ class GuardBuilder(GuardBuilderBase):
         if isinstance(value, torch._subclasses.FakeTensor) and value.pytype:
             t = value.pytype
         else:
-            t = type(value)
+            from torch._library.fake_class_registry import FakeScriptObject
+
+            if isinstance(value, FakeScriptObject):
+                # During compile-time tracing, opaque objects like DeviceMesh
+                # are wrapped in FakeScriptObject. Guard against the real
+                # underlying type so the guard passes at runtime.
+                t = type(value.real_obj)
+            else:
+                t = type(value)
 
         if t.__qualname__ != t.__name__:
             # Type match guards must be local scope, this is
             # raised in self.serialize_guards
             guard._unserializable = True
 
-        obj_id = self.id_ref(t, f"type({guard.name})")
-        type_repr = repr(t)
-        code = f"___check_type_id({self.arg_ref(guard)}, {obj_id}), type={type_repr}"
-        self._set_guard_export_info(guard, [code])
+        from torch._library.fake_class_registry import FakeScriptObject
 
-        self.get_guard_manager(guard).add_type_match_guard(
-            obj_id,
-            get_verbose_code_parts(
-                code, guard, recompile_hint=f"type {t.__qualname__}"
-            ),
-            guard.user_stack,
-        )
+        if isinstance(value, FakeScriptObject):
+            # Use a lambda guard that unwraps FakeScriptObject before checking
+            # type, so the guard passes both at compile time (FakeScriptObject)
+            # and at runtime (real object).
+            expected_type = t
+
+            def _check_type_through_fake(val, expected=expected_type):
+                from torch._library.fake_class_registry import FakeScriptObject
+
+                if isinstance(val, FakeScriptObject):
+                    return type(val.real_obj) is expected
+                return type(val) is expected
+
+            obj_id = self.id_ref(t, f"type({guard.name})")
+            type_repr = repr(t)
+            code = f"___check_type_id({self.arg_ref(guard)}, {obj_id}), type={type_repr}"
+            self._set_guard_export_info(guard, [code])
+
+            self.get_guard_manager(guard).add_lambda_guard(
+                _check_type_through_fake,
+                get_verbose_code_parts(
+                    code, guard, recompile_hint=f"type {t.__qualname__}"
+                ),
+                guard.user_stack,
+            )
+        else:
+            obj_id = self.id_ref(t, f"type({guard.name})")
+            type_repr = repr(t)
+            code = f"___check_type_id({self.arg_ref(guard)}, {obj_id}), type={type_repr}"
+            self._set_guard_export_info(guard, [code])
+
+            self.get_guard_manager(guard).add_type_match_guard(
+                obj_id,
+                get_verbose_code_parts(
+                    code, guard, recompile_hint=f"type {t.__qualname__}"
+                ),
+                guard.user_stack,
+            )
 
     # Dict versions change on any mutation, so a version captured during one
     # trace is meaningless for a later subgraph reuse check.
