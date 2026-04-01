@@ -560,7 +560,7 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
         memory_warmup_iters: int = 10,
         max_benchmark_duration: int = 25,
         return_mode: str = "mean",
-        grad_to_none: Optional[list[torch.Tensor]] = None,
+        grad_to_none: list[torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> float:
         """Benchmark a GPU callable using torch.profiler.
