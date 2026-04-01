@@ -35,10 +35,10 @@ C10_DIAGNOSTIC_POP()
 C10_DIAGNOSTIC_POP()
 
 py::object CacheEntry::next() {
-  NULL_CHECK(this->_owner);
+  NULL_CHECK(this->_owner_list);
   auto it = this->_owner_loc;
   ++it;
-  if (it == this->_owner->cache_entry_list.end()) {
+  if (it == this->_owner_list->end()) {
     return py::none();
   }
   return py::cast(*it, py::return_value_policy::reference);

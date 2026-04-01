@@ -85,6 +85,9 @@ class CacheSizeRelevantForFrame:
     # Number of CacheEntry objects having same ID_MATCH'd objects as given frame.
     num_cache_entries_with_same_id_matched_objs: int = 0
 
+    # Whether this compile call has isolate_recompiles=True
+    isolate_recompiles: bool = False
+
     def will_compilation_exceed(self, limit: int) -> bool:
         # Checks if a compilation will exceed the given limit (that's why >=).
         return (

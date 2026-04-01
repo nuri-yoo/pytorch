@@ -58,6 +58,8 @@ typedef struct VISIBILITY_HIDDEN CacheEntry {
   ExtraState* _owner{nullptr};
   // Reference to this CacheEntry's location in owner's linked list
   std::list<CacheEntry>::iterator _owner_loc;
+  // Pointer to the owning list (for per-isolate_recompiles next() traversal)
+  std::list<CacheEntry>* _owner_list{nullptr};
   // Reference to string representation of the CompileContext
   std::string trace_annotation;
 

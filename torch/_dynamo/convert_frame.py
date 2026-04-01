@@ -577,6 +577,9 @@ def get_compile_id(
     )
 
 
+_next_isolate_recompiles_id = itertools.count()
+
+
 class ConvertFrameAssert:
     def __init__(
         self,
@@ -586,6 +589,7 @@ class ConvertFrameAssert:
         export_constraints: Any | None = None,
         package: CompilePackage | None = None,
         recompile_limit: int | None = None,
+        isolate_recompiles: bool = False,
     ) -> None:
         # assert export_constraints is None
         reset_graph_break_dup_checker()
@@ -595,6 +599,11 @@ class ConvertFrameAssert:
         self._export_constraints = export_constraints
         self._package = package
         self._recompile_limit = recompile_limit
+        self._isolate_recompiles = isolate_recompiles
+        if isolate_recompiles:
+            self._isolate_recompiles_id = next(_next_isolate_recompiles_id)
+        else:
+            self._isolate_recompiles_id = -1
         self._box = ConvertFrameBox()
 
     @property
@@ -605,6 +614,7 @@ class ConvertFrameAssert:
             self._export,
             self._export_constraints,
             recompile_limit=self._recompile_limit,
+            isolate_recompiles=self._isolate_recompiles,
         )
 
     def __call__(
@@ -620,6 +630,7 @@ class ConvertFrameAssert:
         code = frame.f_code
 
         cache_size = compute_cache_size(frame, cache_entry)
+        cache_size.isolate_recompiles = self._isolate_recompiles
         input_codes.add(code)
         if code in output_codes:
             return ConvertFrameReturn()
@@ -771,6 +782,7 @@ def convert_frame_assert(
     export_constraints: Any | None = None,
     package: CompilePackage | None = None,
     recompile_limit: int | None = None,
+    isolate_recompiles: bool = False,
 ) -> ConvertFrameAssert:
     """Fully convert a frame into an FX graph, raising an exception if we fail."""
     return ConvertFrameAssert(
@@ -780,6 +792,7 @@ def convert_frame_assert(
         export_constraints,
         package,
         recompile_limit,
+        isolate_recompiles,
     )
 
 
@@ -2117,6 +2130,7 @@ class ConvertFrame:
         hooks: Hooks,
         package: CompilePackage | None = None,
         recompile_limit: int | None = None,
+        isolate_recompiles: bool = False,
     ) -> None:
         self._torchdynamo_orig_backend = compiler_fn
         self._inner_convert = convert_frame_assert(
@@ -2124,9 +2138,12 @@ class ConvertFrame:
             one_graph=False,
             package=package,
             recompile_limit=recompile_limit,
+            isolate_recompiles=isolate_recompiles,
         )
         self._hooks = hooks
         self._recompile_limit = recompile_limit
+        self._isolate_recompiles = isolate_recompiles
+        self._isolate_recompiles_id = self._inner_convert._isolate_recompiles_id
 
     @property
     def _clone_with_backend(self) -> Callable[[WrapBackendDebug], ConvertFrame]:
@@ -2134,6 +2151,7 @@ class ConvertFrame:
             backend,
             self._hooks,
             recompile_limit=self._recompile_limit,
+            isolate_recompiles=self._isolate_recompiles,
         )
 
     def __call__(
@@ -2249,7 +2267,13 @@ class ConvertFrame:
                 isinstance(e, exc.TorchDynamoException)
                 and e.frame_exec_strategy is not None
             ):
-                return ConvertFrameReturn(frame_exec_strategy=e.frame_exec_strategy)
+                return ConvertFrameReturn(
+                    frame_exec_strategy=e.frame_exec_strategy,
+                    # Don't apply strategy to the code object when
+                    # isolate_recompiles is set — other compile calls sharing
+                    # this code object should still be able to compile.
+                    apply_to_code=not self._isolate_recompiles,
+                )
 
         return ConvertFrameReturn()
 
@@ -2259,10 +2283,15 @@ def convert_frame(
     hooks: Hooks,
     package: CompilePackage | None = None,
     recompile_limit: int | None = None,
+    isolate_recompiles: bool = False,
 ) -> ConvertFrame:
     """Try to convert a frame into an FX graph, if error leave frame unmodified"""
     return ConvertFrame(
-        compiler_fn, hooks, package=package, recompile_limit=recompile_limit
+        compiler_fn,
+        hooks,
+        package=package,
+        recompile_limit=recompile_limit,
+        isolate_recompiles=isolate_recompiles,
     )
 
 

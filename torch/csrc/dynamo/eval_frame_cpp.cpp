@@ -521,6 +521,7 @@ PyObject* dynamo__custom_eval_frame(
   std::unique_ptr<FrameLocalsMapping> locals =
       std::make_unique<FrameLocalsMapping>(frame);
   PyObject* backend = get_backend(callback.ptr()); // borrowed
+  int64_t isolate_recompiles_id = get_current_isolate_recompiles_id();
 
   // We don't run the current custom_eval_frame behavior for guards.
   // So we temporarily set the callback to Py_None to drive the correct behavior
@@ -537,6 +538,7 @@ PyObject* dynamo__custom_eval_frame(
       extra,
       locals.get(),
       backend,
+      isolate_recompiles_id,
       &maybe_cached_code,
       &trace_annotation,
       is_skip_guard_eval_unsafe);
@@ -560,8 +562,8 @@ PyObject* dynamo__custom_eval_frame(
   // at all; these reduces overtriggering and we don't need to do guard
   // collectives the very first time we've seen a frame
   // TODO: We could also check if we had just created extra for the first
-  // time?  Not too sure the best condition for extra->cache_entry_list
-  if (guard_complete_hook != nullptr && !extra->cache_entry_list.empty()) {
+  // time?  Not too sure the best condition for extra->cache_entry_map
+  if (guard_complete_hook != nullptr && extra->has_any_cache_entries()) {
     py::handle guard_complete_hook_handle(guard_complete_hook);
     // False means force compilation (someone cache missed)
     py::object res = guard_complete_hook_handle(maybe_cached_code != Py_None);
@@ -596,7 +598,7 @@ PyObject* dynamo__custom_eval_frame(
   }
 
   // call callback
-  CacheEntry* cache_entry = extract_cache_entry(extra);
+  CacheEntry* cache_entry = extract_cache_entry(extra, isolate_recompiles_id);
   FrameState* frame_state = extract_frame_state(extra);
   py::object callback_result;
   FrameExecStrategy new_strategy;
