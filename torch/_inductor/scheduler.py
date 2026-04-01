@@ -4148,17 +4148,18 @@ class Scheduler:
                     ms_fused_choice = choice
         return min_ms_fused, ms_fused_choice, new_timings
 
-    def _autotune_fused_epilogue(
+    def _autotune_fused_template(
         self,
         multi_node: ir.MultiTemplateBuffer,
         node_list_fused: Sequence[BaseSchedulerNode],
-        node_list_2: Sequence[BaseSchedulerNode],
+        node_list_standalone: Sequence[BaseSchedulerNode],
         device: torch.device,
+        epilogue_fusion: bool,
         log_fusion: Callable[[float, float, float], None],
     ) -> FusionResult:
         """
         Autotune all Triton configs at fusion time: benchmark each
-        config fused with the epilogue, comparing against extern baseline.
+        config fused with the epilogue/prologue, comparing against extern baseline.
         """
         from torch._inductor.codegen.simd import CantSplit
 
@@ -4177,12 +4178,19 @@ class Scheduler:
             fusion_log.debug("No extern callers found, skipping fusion-time autotuning")
             return FusionResult.fuse(False)
 
-        ms2, _ = self.benchmark_fused_nodes(node_list_2)
+        ms_standalone, _ = self.benchmark_fused_nodes(node_list_standalone)
 
         # Compile all Triton choices with fusion
         future_choices: list[tuple[Any, LambdaFuture | None, ModuleType]] = []
         for choice in multi_node.choices:
             if not isinstance(choice, TritonTemplateCallerBase):
+                continue
+            # For prologue fusion, skip choices that don't support all prologue inputs
+            if (
+                not epilogue_fusion
+                and hasattr(choice, "allowed_prologue_inps")
+                and choice.allowed_prologue_inps != multi_node.allowed_prologue_inps
+            ):
                 continue
             with multi_node.swap_as_triton_caller(choice):
                 try:
@@ -4205,12 +4213,12 @@ class Scheduler:
                 future_choices,
                 # pyrefly: ignore [bad-argument-type]
                 device,
-                epilogue_fusion=True,
+                epilogue_fusion=epilogue_fusion,
             )
 
-            log_fusion(min_ms_fused, extern_time, ms2)
+            log_fusion(min_ms_fused, extern_time, ms_standalone)
 
-            if min_ms_fused < (extern_time + ms2) and ms_fused_choice is not None:
+            if min_ms_fused < (extern_time + ms_standalone) and ms_fused_choice is not None:
                 # pyrefly: ignore [missing-attribute]
                 multi_node.finalize_as_triton_caller(ms_fused_choice)
                 multi_node._choice_timings[None] = new_timings
@@ -4498,13 +4506,15 @@ class Scheduler:
             if self._has_layout_conflict_for_template(multi_node):
                 return FusionResult.fuse(False)
 
-            if config.autotune_gemm_at_epilogue_fusion_time and epilogue_fusion:
-                return self._autotune_fused_epilogue(
+            if config.autotune_gemm_at_epilogue_fusion_time:
+                node_list_standalone = node_list_2 if epilogue_fusion else node_list_1
+                return self._autotune_fused_template(
                     multi_node,
                     node_list_fused,
-                    node_list_2,
+                    node_list_standalone,
                     device,
-                    log_fusion,
+                    epilogue_fusion=epilogue_fusion,
+                    log_fusion=log_fusion,
                 )
 
             hint_override_best_fusion_choice: dict[

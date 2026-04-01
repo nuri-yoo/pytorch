@@ -356,7 +356,7 @@ if HAS_GPU_AND_TRITON:
             m = torch.nn.Linear(256, 256, bias=True).half().to(GPU_TYPE)
             inp = torch.rand([256, 256]).half().to(GPU_TYPE)
 
-            original = Scheduler._autotune_fused_epilogue
+            original = Scheduler._autotune_fused_template
             called = [False]
 
             def tracking_wrapper(self_sched, *args, **kwargs):
@@ -367,13 +367,44 @@ if HAS_GPU_AND_TRITON:
             with (
                 torch.no_grad(),
                 mock_patch.object(
-                    Scheduler, "_autotune_fused_epilogue", tracking_wrapper
+                    Scheduler, "_autotune_fused_template", tracking_wrapper
                 ),
             ):
                 expected = foo(m, inp)
                 actual = foo_c(m, inp)
 
-            self.assertTrue(called[0], "_autotune_fused_epilogue was not called")
+            self.assertTrue(called[0], "_autotune_fused_template was not called")
+            self.assertEqual(expected, actual, atol=1e-4, rtol=1.1)
+
+        @fresh_cache()
+        @config.patch(autotune_gemm_at_epilogue_fusion_time=True, prologue_fusion=True)
+        def test_autotune_fused_prologue(self):
+            from unittest.mock import patch as mock_patch
+
+            def foo(x, y):
+                return (x * 2) @ y
+
+            x = torch.rand([256, 256]).half().to(GPU_TYPE)
+            y = torch.rand([256, 256]).half().to(GPU_TYPE)
+
+            original = Scheduler._autotune_fused_template
+            called = [False]
+
+            def tracking_wrapper(self_sched, *args, **kwargs):
+                called[0] = True
+                return original(self_sched, *args, **kwargs)
+
+            foo_c = torch.compile(mode="max-autotune-no-cudagraphs")(foo)
+            with (
+                torch.no_grad(),
+                mock_patch.object(
+                    Scheduler, "_autotune_fused_template", tracking_wrapper
+                ),
+            ):
+                expected = foo(x, y)
+                actual = foo_c(x, y)
+
+            self.assertTrue(called[0], "_autotune_fused_template was not called for prologue")
             self.assertEqual(expected, actual, atol=1e-4, rtol=1.1)
 
 
