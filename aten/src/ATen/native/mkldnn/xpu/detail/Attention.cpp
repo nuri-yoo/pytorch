@@ -697,14 +697,41 @@ partition create_sdpa_backward_graph_partition(
   matmul_grad_prop.set_attr<bool>(op::attr::transpose_b, true);
 
   // grad_masked_score = softmaxbackward(grad_prop)
-  logical_tensor grad_masked_score{lt_id++, sdpa_intermediate_dtype};
-  op softmax_backward{
+  // decompos softmax backward: dS = P * (dP - rowsum(O * dO))
+  logical_tensor out_dot_gradout{lt_id++, sdpa_intermediate_dtype};
+  op mul_odo{
       op_id++,
-      op::kind::SoftMaxBackward,
-      {grad_prop, prob},
+      op::kind::Multiply,
+      {params.out, params.grad_out},
+      {out_dot_gradout},
+      "mul_odo"};
+
+  logical_tensor reduced_odo{lt_id++, sdpa_intermediate_dtype};
+  op reduce_odo{
+      op_id++,
+      op::kind::ReduceSum,
+      {out_dot_gradout},
+      {reduced_odo},
+      "reducesum_odo"};
+  reduce_odo.set_attr<std::vector<int64_t>>(op::attr::axes, {-1});
+  reduce_odo.set_attr<bool>(op::attr::keep_dims, true);
+
+  logical_tensor dp_sub_reduced_odo{lt_id++, sdpa_intermediate_dtype};
+  op dp_sub{
+      op_id++,
+      op::kind::Subtract,
+      {grad_prop, reduced_odo},
+      {dp_sub_reduced_odo},
+      "dp_sub"};
+  
+  logical_tensor grad_masked_score{lt_id++, sdpa_intermediate_dtype};
+  op mul_softmax_backward{
+      op_id++,
+      op::kind::Multiply,
+      {prob, dp_sub_reduced_odo},
       {grad_masked_score},
-      "softmax_backward"};
-  softmax_backward.set_attr<int64_t>(op::attr::axis, -1);
+      "mul_softmax_backward"};
+
 
   // TODO: add output tensor grad_attn_mask = grad_masked_score once OneDNN
   // supports output grad_attn_mask.
@@ -776,7 +803,10 @@ partition create_sdpa_backward_graph_partition(
   g.add_op(exp);
   g.add_op(matmul_grad_value);
   g.add_op(matmul_grad_prop);
-  g.add_op(softmax_backward);
+  g.add_op(mul_odo);
+  g.add_op(reduce_odo);
+  g.add_op(dp_sub);
+  g.add_op(mul_softmax_backward);
   g.add_op(grad_scale_mul);
   g.add_op(matmul_grad_query);
   g.add_op(matmul_grad_key);
