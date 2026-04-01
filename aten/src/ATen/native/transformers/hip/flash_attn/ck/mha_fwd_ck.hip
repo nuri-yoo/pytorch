@@ -9,7 +9,7 @@
 #include <cstdio>
 
 namespace {
-
+/* Debug traces. Comment in to aid in debug of 'Invalid argument to fmha_fwd' error
 const char* mask_enum_str(mask_enum m) {
     switch (m) {
         case mask_enum::no_mask:          return "no_mask";
@@ -70,7 +70,7 @@ void dump_fmha_fwd_kernel_selection_params(const fmha_fwd_traits& t,
     std::printf("========================================\n");
     std::fflush(stdout);
 }
-
+*/
 } // anonymous namespace
 
 namespace pytorch_flash {
