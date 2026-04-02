@@ -658,14 +658,14 @@ class CtxManagerTests(torch._dynamo.test_case.TestCaseWithNestedGraphBreaks):
         self.assertEqual(exported.device.index, 0)
         self.assertEqual(exported.dtype, torch.bfloat16)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @unittest.skipIf(device_type not in ("cuda", "xpu"), "requires cuda or xpu")
     def test_cuda_amp_autocast(self):
         class MyModule(torch.nn.Module):
             def forward(self, x):
-                a_float32 = torch.rand((8, 8), device="cuda")
-                b_float32 = torch.rand((8, 8), device="cuda")
+                a_float32 = torch.rand((8, 8), device=device_type)
+                b_float32 = torch.rand((8, 8), device=device_type)
 
-                with torch.autocast(device_type="cuda", dtype=torch.float64):
+                with torch.autocast(device_type=device_type, dtype=torch.float64):
                     c_float64 = torch.mm(a_float32, b_float32)
                 return c_float64
 
@@ -679,7 +679,7 @@ class CtxManagerTests(torch._dynamo.test_case.TestCaseWithNestedGraphBreaks):
         self.assertEqual(exported.device, real_device)
         self.assertEqual(exported.dtype, real_dtype)
 
-        self.assertEqual(exported.device.type, "cuda")
+        self.assertEqual(exported.device.type, device_type)
         self.assertEqual(exported.device.index, 0)
         self.assertEqual(exported.dtype, torch.float64)
 
@@ -932,15 +932,15 @@ class CtxManagerTests(torch._dynamo.test_case.TestCaseWithNestedGraphBreaks):
         self.assertEqual(out_32.device.type, "cpu")
         self.assertEqual(out_32.dtype, torch.float32)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @unittest.skipIf(device_type not in ("cuda", "xpu"), "requires cuda or xpu")
     def test_autocast_float64(self):
         class MyModule(torch.nn.Module):
             def forward(self, x):
-                a_float32 = torch.rand((8, 8), device="cuda")
-                b_float32 = torch.rand((8, 8), device="cuda")
-                d_float32 = torch.rand((8, 8), device="cuda")
+                a_float32 = torch.rand((8, 8), device=device_type)
+                b_float32 = torch.rand((8, 8), device=device_type)
+                d_float32 = torch.rand((8, 8), device=device_type)
 
-                with torch.autocast(device_type="cuda", dtype=torch.float64):
+                with torch.autocast(device_type=device_type, dtype=torch.float64):
                     e_float64 = torch.mm(a_float32, b_float32)
                     f_float64 = torch.mm(d_float32, e_float64)
                 return f_float64
