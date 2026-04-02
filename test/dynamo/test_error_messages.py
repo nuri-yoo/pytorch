@@ -694,18 +694,15 @@ Graph break under GenericContextWrappingVariable
 
 Source of graph break:
                     torch._dynamo.graph_break()
-                    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 
 Related values:
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                 with GenericCtxMgr():
-                     ^^^^^^^^^^^^^^^
 
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                     with GenericCtxMgr():
-                         ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_generic_ctx_mgr_graph_break_fullgraph_false
@@ -839,7 +836,6 @@ Call to `torch._dynamo.graph_break()`
 
 Source of graph break:
             torch._dynamo.graph_break()
-            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_reconstruction_failure_gb
     torch.compile(fn, backend="eager")()
@@ -868,7 +864,6 @@ Reconstruction failure
 
 Source of graph break:
             torch._dynamo.graph_break()
-            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_reconstruction_failure_gb
     torch.compile(fn, backend="eager")()
@@ -1009,7 +1004,6 @@ Graph Break Reason: Data-dependent branching
 
 Source of graph break:
             if x.sum() > 0:
-               ^^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_data_dependent_branching_gb
     torch.compile(fn, backend="eager")(torch.randn(3))
@@ -1049,13 +1043,11 @@ Data-dependent assertion failed (cannot compile partial graph)
 
 Source of graph break:
                 assert x is None  # noqa: S101
-                       ^^^^^^^^^
 
 Related values:
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                 with GenericCtxMgr():
-                     ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_assert_failure_in_generic_ctx_mgr
@@ -1203,13 +1195,11 @@ graph break in loop
 
 Source of graph break:
                 torch._dynamo.graph_break()
-                ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 
 Related values:
   RangeIteratorVariable() originated from:
   File "test_error_messages.py", line N
                 for i in range(2):
-                         ^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_in_loop
@@ -1257,13 +1247,11 @@ graph break in loop
 
 Source of graph break:
                 if x.sum() > 0:
-                   ^^^^^^^^^^^
 
 Related values:
   RangeIteratorVariable() originated from:
   File "test_error_messages.py", line N
                 for i in range(2):
-                         ^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_in_loop
@@ -1301,18 +1289,15 @@ Data-dependent branching
 
 Source of graph break:
                     if x.sum() > 0:
-                       ^^^^^^^^^^^
 
 Related values:
   RangeIteratorVariable() originated from:
   File "test_error_messages.py", line N
                 for i in range(2):
-                         ^^^^^^^^
 
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                     with GenericCtxMgr():
-                         ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_skip_frame_in_loop_message
@@ -1372,7 +1357,6 @@ Call to `torch._dynamo.graph_break()`
 
 Source of graph break:
             torch._dynamo.graph_break()  # 1
-            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_compile_user_frames
     torch.compile(fn, backend="eager")(torch.randn(3))
@@ -1553,7 +1537,6 @@ Call to `torch._dynamo.graph_break()`
 
 Source of graph break:
             Foo().attr = x
-            ^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_traceback_above_dynamo_shows_user_code
     f3(torch.randn(3))
@@ -1614,7 +1597,6 @@ Call to `torch._dynamo.graph_break()`
 
 Source of graph break:
             torch._dynamo.graph_break()  # correct
-            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_graph_break_traceback_collapsed_resume_frames
     f1(torch.randn(3))
@@ -1849,7 +1831,6 @@ Call to `torch._dynamo.step_unsupported()`
 
 Source of graph break:
             torch._dynamo.step_unsupported()
-            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_step_graph_break
     fn(torch.ones(3))
@@ -1908,7 +1889,6 @@ Call to `torch._dynamo.graph_break()`
 
 Source of graph break:
             Foo().attr = x
-            ^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_store_attr_graph_break
     fn(torch.ones(3))
@@ -2048,7 +2028,6 @@ HOP: Unsafe side effect
 
 Source of graph break:
             return torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=True)
-                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
 User code traceback:
   File "test_error_messages.py", line N, in test_hop_side_effect_error_includes_hop_context_fullgraph_false
     torch.compile(model, backend="eager", fullgraph=False)(torch.rand(4))
@@ -2326,18 +2305,15 @@ Graph break under GenericContextWrappingVariable
 
 Source of graph break:
                     inner()
-                    ~~~~~^^
 
 Related values:
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                 with GenericCtxMgr():
-                     ^^^^^^^^^^^^^^^
 
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                     with GenericCtxMgr():
-                         ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_generic_ctx_mgr
@@ -2425,13 +2401,11 @@ Graph break under GenericContextWrappingVariable
 
 Source of graph break:
                 torch._dynamo.graph_break()
-                ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 
 Related values:
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                 with GenericCtxMgr():
-                     ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_skipped_frame_with_verbose_traceback_nested
@@ -2488,18 +2462,15 @@ Data-dependent branching
 
 Source of graph break:
                     if x.sum() > 0:
-                       ^^^^^^^^^^^
 
 Related values:
   RangeIteratorVariable() originated from:
   File "test_error_messages.py", line N
                 for i in range(2):
-                         ^^^^^^^^
 
   WithExitFunctionVariable() originated from:
   File "test_error_messages.py", line N
                     with GenericCtxMgr():
-                         ^^^^^^^^^^^^^^^
 
 User code traceback:
   File "test_error_messages.py", line N, in test_skip_frame_in_loop_message_nested
@@ -2658,7 +2629,6 @@ Call to `torch._dynamo.graph_break()`
 
 Source of graph break:
             torch._dynamo.graph_break()
-            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_graph_break_different_call_sites_not_suppressed
     outer(torch.ones(3))
@@ -2685,7 +2655,6 @@ Call to `torch._dynamo.graph_break()`
 
 Source of graph break:
             torch._dynamo.graph_break()
-            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
 User code traceback:
   File "test_error_messages.py", line N, in test_nested_graph_break_different_call_sites_not_suppressed
     outer(torch.ones(3))
