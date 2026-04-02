@@ -1604,7 +1604,9 @@ class SchedulerNode(BaseSchedulerNode):
         recompute_sizes_body_func: Callable[..., Any] | None = None,
     ) -> None:
         fake_deps: OrderedSet[Dep] = OrderedSet(
-            dep for dep in self.read_writes.reads if isinstance(dep, (WeakDep, StarDep, UserTritonDep))
+            dep
+            for dep in self.read_writes.reads
+            if isinstance(dep, (WeakDep, StarDep, UserTritonDep))
         )
         self._compute_attrs(
             extra_indexing_constraints=extra_indexing_constraints,
@@ -5849,7 +5851,6 @@ class Scheduler:
                 why("node1 is extern but node2.node.data is not Pointwise")
                 return False
 
-            assert len(node1.node.mutation_outputs) == 1
             written_buffer_name = node1.node.mutation_outputs[0].name
 
             # The epilogue can only reference the mutated output buffer.
@@ -5862,7 +5863,10 @@ class Scheduler:
             # the epilogue depends on expressions which may not available in the user triton kernel
             # (e.g. indexing exprs used not in a load)
             if any(
-                any(usage != "load" for usage in node2.node.data.collect_inner_fn_symbol_usage(sym))
+                any(
+                    usage != "load"
+                    for usage in node2.node.data.collect_inner_fn_symbol_usage(sym)
+                )
                 for sym in node2.node.data.inner_fn_free_symbols()
             ):
                 why("epilogue uses indexing variables outside of loads")
@@ -6061,7 +6065,9 @@ class Scheduler:
             remaining_deps_by_name[name].append(dep)
 
         for cd in node1.read_writes.writes:
-            if not isinstance(cd, MemoryDep) and not isinstance(cd, (StarDep, UserTritonDep)):
+            if not isinstance(cd, MemoryDep) and not isinstance(
+                cd, (StarDep, UserTritonDep)
+            ):
                 continue
             remaining = remaining_deps_by_name.get(
                 self.mutation_renames.get(cd.name, cd.name)

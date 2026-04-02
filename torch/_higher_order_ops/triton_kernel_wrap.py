@@ -934,297 +934,17 @@ def ttir_to_functions(
     return functions
 
 
-class MemoizeWithCycleCheck:
-    fn: Callable[..., Any]
-    cache: dict[tuple[Any], Any]
-
-    def __init__(self, fn: Callable[..., Any]) -> None:
-        self.fn = fn
-        self.reset()
-
-    def __call__(
-        self,
-        functions: dict[str, dict[Intermediate, list[Op]]],
-        fn_name: str,
-        *args: Any,
-    ) -> Any:
-        key: tuple[Any, ...] = (fn_name, *args)
-        if key not in self.cache:
-            self.cache[key] = None
-            self.cache[key] = self.fn(functions, fn_name, *args)
-        if self.cache[key] is None:
-            raise RuntimeError("Recursion is not supported")
-        return self.cache[key]
-
-    def reset(self) -> None:
-        self.cache = {}
-
-
-@MemoizeWithCycleCheck
-def get_tma_stores(
-    functions: dict[str, dict[Intermediate, list[Op]]], fn_name: str
-) -> set[Intermediate | Param]:
-    """
-    Identifies all intermediates and parameters that are written to by a
-    `tt.experimental_descriptor_store`. It tracks only the specific values
-    written to via experimental_descriptor_store and the input values to
-    `tt.reinterpret_tensor_descriptor` used to construct the direct inputs
-    to tt.experimental_descriptor_store - not any recursive values
-    used to construct those values.
-
-    For example: for
-      tt.reinterpret_tensor_descriptor(Intermediate(idx=0), ...)
-      Intermediate(idx=1) = tt.experimental_descriptor_store(Intermediate(idx=0), ...)
-    this function will return [Intermediate(idx=0), Intermediate(idx=1)],
-
-    However
-      Intermediate(idx=4) = arith.addptr(Intermediate(idx=2), Intermediate(idx=3))
-      Intermediate(idx=5) = tt.experimental_descriptor_store(Intermediate(idx=4), ...)
-      tt.experimental_descriptor_store(Intermediate(idx=5), ...)
-    this function will mark only idx=4 and idx=5 (but not idx=2 or idx=3)
-
-    If an intermediate/parameter is passed into a function and is written to
-    via experimental_descriptor_store within that function, the argument to the
-    function will also be marked.
-    """
-
-    result: set[Intermediate | Param] = set()
-
-    ops = functions[fn_name]
-    for op_list in ops.values():
-        for op in op_list:
-            if op.name == "tt.call":
-                if op.fn_call_name not in functions:
-                    raise AssertionError(
-                        f"Function {op.fn_call_name} not found in functions for TMA stores"
-                    )
-                # pyrefly: ignore [bad-argument-type]
-                tma_stores = get_tma_stores(functions, op.fn_call_name)
-                for i, inp in enumerate(op.args):
-                    if Param(idx=i) in tma_stores:
-                        result.add(inp)
-            elif op.name == "tt.experimental_descriptor_store":
-                if len(op.args) < 1:
-                    raise AssertionError(
-                        f"tt.experimental_descriptor_store expected at least 1 arg, got {len(op.args)}"
-                    )
-                result.add(op.args[0])
-            elif op.name == "tt.descriptor_store":
-                if len(op.args) < 1:
-                    raise AssertionError(
-                        f"tt.descriptor_store expected at least 1 arg, got {len(op.args)}"
-                    )
-                result.add(op.args[0])
-
-    for val in list(result):
-        if val in ops:
-            if not isinstance(val, Intermediate):
-                continue
-            for op in ops[val]:
-                if op.name == "tt.reinterpret_tensor_descriptor":
-                    if len(op.args) < 1:
-                        raise AssertionError(
-                            "tt.reinterpret_tensor_descriptor expected at least 1 arg, "
-                            f"got {len(op.args)}"
-                        )
-                    result.add(op.args[0])
-
-    return result
-
-
 @dataclasses.dataclass
 class TensorAccesses:
     read_writes: "ReadWrites"
     can_fuse_epilogue: bool
 
 
-@MemoizeWithCycleCheck
-def analyze_kernel_access(
-    functions: dict[str, dict[Intermediate, list[Op]]],
-    fn_name: str,
-    num_args: int,
-    tensor_names: tuple[str, ...],
-    tensor_arg_indices: frozenset[int] | None,
-) -> TensorAccesses:
-    """
-    Analyzes the graph to detect which arguments are written to and which are read.
-
-    For writes: traverses from write sinks (tt.store, tt.atomic_cas, etc.) backwards
-    to identify input pointers that are written to.
-
-    For reads: traverses from read operations (tt.load) backwards to identify
-    input pointers that are read from.
-
-    Returns ReadWrites with StarDep objects for each accessed tensor.
-    """
-    from torch._inductor.dependencies import Dep, ReadWrites, StarDep
-
-    # Name of mutation op to mutated parameter indices
-    # List from Triton Github include/triton/Dialect/Triton/IR/TritonOps.td
-    # All the OPs that have MemWrite trait.
-    # What if Triton exposed this?
-    WRITE_OPS = {
-        "tt.store": [0],
-        "tt.atomic_cas": [0],
-        "tt.atomic_rmw": [0],
-        "tt.experimental_descriptor_store": [0],
-        "tt.experimental_tensormap_create": [0],
-        "tt.descriptor_store": [0],
-    }
-    READ_OPS = {
-        "tt.load": [0],
-        "tt.load_tensor_descriptor": [0],
-        "tt.descriptor_load": [0],
-    }
-    UNKNOWN_OPS = {"tt.elementwise_inline_asm"}
-
-    write_stack: list[Param | Intermediate] = []
-    read_stack: list[Param | Intermediate] = []
-
-    ops = functions[fn_name]
-    tma_stores = get_tma_stores(functions, fn_name)
-
-    for op_list in ops.values():
-        for op in op_list:
-            # If we encounter an operation with effects that cannot be reliably analyzed
-            # (e.g. `tt.elementwise_inline_asm`), we assume it does not mutate any input parameters.
-            if op.name in UNKNOWN_OPS:
-                if op.name == "tt.elementwise_inline_asm" and op.is_pure:
-                    continue
-                raise RuntimeError(
-                    f"ttir analysis hit an op we do not know how to analyze: {op.name}"
-                )
-
-            if op.name == "tt.experimental_tensormap_create":
-                # Note: this is how we implement experimental_descriptor_store mutation analysis.
-                # for on-device TMA.
-                # experimental_tensormap_store(a, b, ...) stores b to the location specified
-                # by descriptor in the memory of a.
-                # To track this, we first find all the intermediates/params to which we store via
-                # experimental_tensormap_store (get_tma_stores, called above). Then, during this
-                # analysis we wait to find the corresponding experimental_tensormap_create (if it
-                # exists), at which point we will mark the global_ptr as mutated (as done below).
-                if len(op.args) < 2:
-                    raise AssertionError(
-                        f"tt.experimental_tensormap_create expected at least 2 args, "
-                        f"got {len(op.args)}"
-                    )
-                if op.args[0] in tma_stores:
-                    write_stack.append(op.args[1])
-
-            if op.name == "tt.call":
-                if op.fn_call_name not in functions:
-                    raise AssertionError(
-                        f"Function {op.fn_call_name} not found in functions dict"
-                    )
-                # Create placeholder names for nested function arguments
-                nested_names = tuple(f"_arg{i}" for i in range(len(op.args)))
-
-                # Do not pass tensor_arg_indices, most outer call of
-                # analyze_kernel_access will filter Param nodes.
-                accesses = analyze_kernel_access(
-                    functions,
-                    # pyrefly: ignore [bad-argument-type]
-                    op.fn_call_name,
-                    len(op.args),
-                    nested_names,
-                    None,
-                )
-                # Map back from StarDep names to args
-                written_set = {dep.name for dep in accesses.read_writes.writes}
-                read_set = {dep.name for dep in accesses.read_writes.reads}
-                for arg, name in zip(op.args, nested_names):
-                    if name in written_set:
-                        write_stack.append(arg)
-                    if name in read_set:
-                        read_stack.append(arg)
-            else:
-                write_stack.extend(op.args[idx] for idx in WRITE_OPS.get(op.name, []))
-                read_stack.extend(op.args[idx] for idx in READ_OPS.get(op.name, []))
-
-    # For these ops, only the first argument (base pointer) refers to actual
-    # memory. The remaining arguments are shape/stride/offset metadata and
-    # should not be traced during mutation analysis.
-    POINTER_ONLY_OPS = {
-        "tt.make_tensor_ptr",
-        "tt.advance",
-        "tt.make_tensor_descriptor",
-    }
-
-    def _find_arg_access_count(
-        initial_stack: list[Param | Intermediate],
-        skip_loads: bool,
-    ) -> dict[int, int]:
-        """DFS traversal to find argument indices that are accessed (and how many times they are accessed)."""
-        access_count = dict()
-        stack = initial_stack[:]
-
-        while stack:
-            arg = stack.pop()
-
-            if isinstance(arg, Param):
-                if arg.idx >= num_args:
-                    continue
-                if tensor_arg_indices is not None and arg.idx not in tensor_arg_indices:
-                    continue
-                if arg.idx not in access_count:
-                    access_count[arg.idx] = 1
-                else:
-                    access_count[arg.idx] += 1
-            elif isinstance(arg, Intermediate) and not arg.fake():
-                for op in ops[arg]:
-                    if skip_loads and op.name == "tt.load":
-                        continue
-                    if op.name in POINTER_ONLY_OPS:
-                        stack.append(op.args[0])
-                    else:
-                        stack.extend(op.args)
-
-        return access_count
-
-    write_count = _find_arg_access_count(write_stack, skip_loads=True)
-    read_count = _find_arg_access_count(read_stack, skip_loads=False)
-
-    writes: OrderedSet[Dep] = OrderedSet(
-        StarDep(tensor_names[i]) for i in sorted(write_count.keys())
-    )
-    reads: OrderedSet[Dep] = OrderedSet(
-        StarDep(tensor_names[i]) for i in sorted(read_count.keys())
-    )
-
-    read_writes = ReadWrites(
-        reads=reads,
-        writes=writes,
-        index_exprs=OrderedSet(),
-    )
-
-    def _decide_can_fuse_epilogue():
-        # only do epilogue fusion if the kernel has a single output tensor
-        if len(write_count) != 1:
-            return False
-
-        written_arg_index = next(iter(write_count))
-        # only do epilogue fusion if the written tensor is written exactly once
-        if write_count[written_arg_index] != 1:
-            return False
-
-        written_arg_name = next(iter(writes)).name
-        #  cannot fuse if the kernel also reads from the output buffer
-        if any(read_dep.name == written_arg_name for read_dep in reads):
-            return False
-
-        return True
-
-    can_fuse_epilogue = _decide_can_fuse_epilogue()
-
-    return TensorAccesses(read_writes=read_writes, can_fuse_epilogue=can_fuse_epilogue)
-
-
 def identify_accessed_tensors(
     kernel: "TritonKernelType",
     kwargs: dict[str, Any],
     tma_descriptor_metadata: TMADescriptorMetadata,
-    grid: Any = None,  # FIXME
+    grid: Any = None,
 ) -> TensorAccesses:
     """
     Given a triton kernel and the arguments for this kernel, this function
@@ -1233,7 +953,7 @@ def identify_accessed_tensors(
     3) Analyzes the graph to detect which input tensors are read and/or written
     """
 
-    from torch._inductor.dependencies import Dep, ReadWrites, UserTritonDep 
+    from torch._inductor.dependencies import Dep, ReadWrites, UserTritonDep
     from torch._inductor.ir import TensorBox
 
     ttir_module = None
@@ -1242,7 +962,6 @@ def identify_accessed_tensors(
         ttir_module, ordered_arg_names = generate_ttir(
             kernel, kwargs, tma_descriptor_metadata
         )
-        # print(ttir_module)
 
         # extract functions from TTIR using MLIR bindings exposed by Triton code
         functions = ttir_to_functions(ttir_module)
@@ -1257,11 +976,6 @@ def identify_accessed_tensors(
             raise AssertionError(
                 f"Kernel name {kernel_fn_name} not found in TTIR kernel name {kernel_name}"
             )
-        # Reset the cache between top level invocations
-        # The cache for analyze kernel access is mainly used for cycle
-        # detection, so each top level invocation needs a clean cache
-        analyze_kernel_access.reset()
-        get_tma_stores.reset()
 
         # Build frozenset of indices corresponding to tensor args only.
         # Used to filter out scalars which are transitively captured as mutated
@@ -1280,14 +994,6 @@ def identify_accessed_tensors(
             tuple(ordered_arg_names),
             tensor_arg_indices,
         ).analyze()
-
-        return analyze_kernel_access(
-            functions,
-            kernel_name,
-            len(ordered_arg_names),
-            tuple(ordered_arg_names),
-            tensor_arg_indices,
-        )
     except Exception:
         log.warning(
             "Encountered an exception in identify_accessed_tensors, assuming every input is mutated",
@@ -1307,8 +1013,9 @@ def identify_accessed_tensors(
             for key, value in kwargs.items()
             if isinstance(value, (Tensor, TensorBox))
         ]
-        # TODO: Use UserTritonDep
-        all_deps = OrderedSet(UserTritonDep(name=name, index=None) for name in all_tensor_names)
+        all_deps = OrderedSet(
+            UserTritonDep(name=name, index=None) for name in all_tensor_names
+        )
         all_deps = typing.cast(OrderedSet[Dep], all_deps)
         return TensorAccesses(
             ReadWrites(
@@ -2600,7 +2307,7 @@ class KernelAccessAnalyzer:
     ) -> tuple[list[Param | Intermediate], list[Param | Intermediate]]:
         ops = self.functions[fn_name]
 
-        tma_stores = get_tma_stores(self.functions, fn_name)
+        tma_stores = KernelAccessAnalyzer._get_tma_stores(self.functions, fn_name)
 
         write_sinks: list[Param | Intermediate] = []
         read_sinks: list[Param | Intermediate] = []
@@ -2671,6 +2378,79 @@ class KernelAccessAnalyzer:
 
         return read_sinks, write_sinks
 
+    @staticmethod
+    def _get_tma_stores(
+        functions: dict[str, dict[Intermediate, list[Op]]], fn_name: str
+    ) -> set[Intermediate | Param]:
+        """
+        Identifies all intermediates and parameters that are written to by a
+        `tt.experimental_descriptor_store`. It tracks only the specific values
+        written to via experimental_descriptor_store and the input values to
+        `tt.reinterpret_tensor_descriptor` used to construct the direct inputs
+        to tt.experimental_descriptor_store - not any recursive values
+        used to construct those values.
+
+        For example: for
+          tt.reinterpret_tensor_descriptor(Intermediate(idx=0), ...)
+          Intermediate(idx=1) = tt.experimental_descriptor_store(Intermediate(idx=0), ...)
+        this function will return [Intermediate(idx=0), Intermediate(idx=1)],
+
+        However
+          Intermediate(idx=4) = arith.addptr(Intermediate(idx=2), Intermediate(idx=3))
+          Intermediate(idx=5) = tt.experimental_descriptor_store(Intermediate(idx=4), ...)
+          tt.experimental_descriptor_store(Intermediate(idx=5), ...)
+        this function will mark only idx=4 and idx=5 (but not idx=2 or idx=3)
+
+        If an intermediate/parameter is passed into a function and is written to
+        via experimental_descriptor_store within that function, the argument to the
+        function will also be marked.
+        """
+
+        result: set[Intermediate | Param] = set()
+
+        ops = functions[fn_name]
+        for op_list in ops.values():
+            for op in op_list:
+                if op.name == "tt.call":
+                    if op.fn_call_name not in functions:
+                        raise AssertionError(
+                            f"Function {op.fn_call_name} not found in functions for TMA stores"
+                        )
+                    # pyrefly: ignore [bad-argument-type]
+                    tma_stores = KernelAccessAnalyzer._get_tma_stores(
+                        functions, op.fn_call_name
+                    )
+                    for i, inp in enumerate(op.args):
+                        if Param(idx=i) in tma_stores:
+                            result.add(inp)
+                elif op.name == "tt.experimental_descriptor_store":
+                    if len(op.args) < 1:
+                        raise AssertionError(
+                            f"tt.experimental_descriptor_store expected at least 1 arg, got {len(op.args)}"
+                        )
+                    result.add(op.args[0])
+                elif op.name == "tt.descriptor_store":
+                    if len(op.args) < 1:
+                        raise AssertionError(
+                            f"tt.descriptor_store expected at least 1 arg, got {len(op.args)}"
+                        )
+                    result.add(op.args[0])
+
+        for val in list(result):
+            if val in ops:
+                if not isinstance(val, Intermediate):
+                    continue
+                for op in ops[val]:
+                    if op.name == "tt.reinterpret_tensor_descriptor":
+                        if len(op.args) < 1:
+                            raise AssertionError(
+                                "tt.reinterpret_tensor_descriptor expected at least 1 arg, "
+                                f"got {len(op.args)}"
+                            )
+                        result.add(op.args[0])
+
+        return result
+
     def _analyze_sinks(
         self,
         sinks: list[Param | Intermediate],
@@ -2693,15 +2473,13 @@ class KernelAccessAnalyzer:
             if self.extract_symbolic:
                 try:
                     self._symbolic.traverse(sink, ops, accesses)  # type: ignore[union-attr]
-                except Exception as e:
+                except Exception:
                     # log.debug(
                     #     "Symbolic analysis failed at op '%s', switching to conservative",
                     #     e.op_name,
                     # )
                     self.extract_symbolic = False
                     conservative.traverse(sink, ops, accesses, skip_loads)
-                    # print(f"Exception {e=}")
-                    # print(accesses)
             else:
                 conservative.traverse(sink, ops, accesses, skip_loads)
 
@@ -2748,8 +2526,6 @@ class KernelAccessAnalyzer:
         )
 
     def _decide_can_fuse_epilogue(self) -> bool:
-        # print(f"{self.write_accesses=}")
-        # print(f"{self.read_accesses=}")
         # only do epilogue fusion if the kernel has a single output tensor
         if len(self.write_accesses) != 1:
             return False
@@ -2802,7 +2578,6 @@ class ConservativeAnalyzer:
                 ):
                     continue
 
-                # TODO: Change accesses value type to list.
                 accesses[arg.idx] = accesses.get(arg.idx, [])
                 accesses[arg.idx].append(1)
             elif isinstance(arg, IterArg):
@@ -2833,7 +2608,7 @@ class SymbolicAnalyzer:
     tensor access.
 
     For each access sink, this class walks the def-use chain upwards building
-    a SymPy expression that represents the memory index as a function of the 
+    a SymPy expression that represents the memory index as a function of the
     kernel's configuration. The expected form of a fully resolved expression is:
         p{idx} + <index_expr>
     where p{idx} is a placeholder symbol for the base pointer of tensor
@@ -2846,7 +2621,7 @@ class SymbolicAnalyzer:
       - Iteration arguments (IterArg): modeled as init + iv * step
 
     Bounds are read and stored in the appropirate dataclass (Op, InductionVar, ...) from
-    MLIR integer attributes during TTIR parsing. If a required attr is absent, 
+    MLIR integer attributes during TTIR parsing. If a required attr is absent,
     `Op.get_int_attr` raises, and this traversal will fall back to ConservativeAnalyzer.
 
     Shape-context ops (tt.expand_dims, tt.broadcast, tt.splat, ...) do not mint
@@ -2943,8 +2718,6 @@ class SymbolicAnalyzer:
         )
 
     def _build_expr(self, node: Intermediate | Param) -> sympy.Expr:
-        # print(f"{type(node)=},")
-
         if isinstance(node, Param):
             param_name = self.arg_names[node.idx]
             param_value = self.kwargs.get(param_name)
@@ -2993,17 +2766,13 @@ class SymbolicAnalyzer:
             assert op_list is not None
             op = op_list[0]
             name = op.name
-            # print(f"{name=}")
 
             handler = self.op_handlers.get(name)
             if handler is None:
-                # print(">" * 4 + f" need handler for {op.name}")
                 raise SymbolicFailure(op.name)
 
             result = handler(op)
         else:
-            # TODO: Error handling needed here?
-            # print(f"Need handler for {type(node)=}")
             raise SymbolicFailure("")
 
         self.recursion_cache[cache_key] = result
@@ -3048,7 +2817,6 @@ class SymbolicAnalyzer:
     def _handle_program_id(self, op: Op) -> sympy.Expr:
         axis = op.get_int_attr("axis")
 
-        # TODO:
         # grid may be a single TritonGridTupleType or a list[TritonGridTupleType] (one per autotuner config).
         # If a list, take the first entry — all configs share the same grid structure.
         grid = self.grid[0] if isinstance(self.grid, list) else self.grid

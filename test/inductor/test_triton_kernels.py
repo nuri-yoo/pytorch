@@ -3754,8 +3754,8 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     def test_get_tma_stores(self):
         from torch._higher_order_ops.triton_kernel_wrap import (
-            get_tma_stores,
             Intermediate,
+            KernelAccessAnalyzer,
             Op,
             Param,
         )
@@ -3783,8 +3783,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
             },
         }
 
-        self.assertEqual(get_tma_stores(functions, "helper"), set())
-        self.assertEqual(get_tma_stores(functions, "main"), set())
+        self.assertEqual(
+            KernelAccessAnalyzer._get_tma_stores(functions, "helper"), set()
+        )
+        self.assertEqual(KernelAccessAnalyzer._get_tma_stores(functions, "main"), set())
 
         functions["helper"][Intermediate(idx=-1)] = [
             Op(
@@ -3794,12 +3796,14 @@ class MutationTests(torch._inductor.test_case.TestCase):
                 Intermediate(idx=-1),
             )
         ]
-        get_tma_stores.reset()
 
         self.assertEqual(
-            get_tma_stores(functions, "helper"), {Param(idx=0), Intermediate(idx=0)}
+            KernelAccessAnalyzer._get_tma_stores(functions, "helper"),
+            {Param(idx=0), Intermediate(idx=0)},
         )
-        self.assertEqual(get_tma_stores(functions, "main"), {Param(idx=0)})
+        self.assertEqual(
+            KernelAccessAnalyzer._get_tma_stores(functions, "main"), {Param(idx=0)}
+        )
 
     @unittest.skipIf(
         not has_triton_experimental_host_tma(),
@@ -5151,13 +5155,15 @@ def make_kernel_access_analyzer_test(fn):
 
 
 class KernelAccessAnalyzerTests(torch._inductor.test_case.TestCase):
-    # - if..else
-    # - document
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
+
+    @classmethod
+    def tearDownClass(cls):
+        torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = False
+        super().tearDownClass()
 
     @make_kernel_access_analyzer_test
     def test_matmul():
