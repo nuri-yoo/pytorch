@@ -294,6 +294,8 @@ class autocast:
                     raise RuntimeError(
                         "Current CUDA Device does not support bfloat16. Please switch dtype to float16."
                     )
+            elif self.device == "xpu":
+                pass  # XPU supports bfloat16 without any special checks
             elif self.fast_dtype not in device_supported_dtypes:
                 error_message = (
                     f"In {device_name} autocast, but the target dtype is not supported. Disabling autocast.\n"
