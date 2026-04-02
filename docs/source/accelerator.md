@@ -35,6 +35,7 @@
     :nosignatures:
 
     Graph
+    generate_graph_pool_handle
 ```
 
 ```{eval-rst}
