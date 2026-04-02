@@ -73,7 +73,8 @@ std::string TURN_OFF_COMPILED_AUTOGRAD_MSG() {
 static void throw_python_error() {
   python_error err;
   err.persist();
-  throw std::move(err);
+  throw std::move(
+      err); // @allow-raw-throw (re-raises captured Python exception)
 }
 
 // RuntimeState contains arbitrary callables created during the forward pass.
