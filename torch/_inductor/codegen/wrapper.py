@@ -522,6 +522,84 @@ class CommentLine(WrapperLine):
 
 
 @dataclasses.dataclass
+class SizeAssertLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    name: str
+    size: list[sympy.Expr]
+    stride: list[sympy.Expr]
+    op_name: str | None = None
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        size_str = self.wrapper.codegen_python_shape_tuple(self.size)
+        stride_str = self.wrapper.codegen_python_shape_tuple(self.stride)
+        if self.op_name is not None:
+            code.writeline(
+                f"assert_size_stride({self.name}, {size_str}, {stride_str}, {self.op_name!r})"
+            )
+        else:
+            code.writeline(f"assert_size_stride({self.name}, {size_str}, {stride_str})")
+
+    @staticmethod
+    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+        return converter._generate_size_assert
+
+
+@dataclasses.dataclass
+class AlignmentAssertLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    name: str
+    align_bytes: int
+    op_name: str | None = None
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(
+            f"assert_alignment({self.name}, {self.align_bytes}, {self.op_name!r})"
+        )
+
+    @staticmethod
+    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+        return converter._generate_alignment_assert
+
+
+@dataclasses.dataclass
+class NanAssertLine(WrapperLine):
+    """
+    Checks for both NaN and Inf values.  This matches the existing behavior of
+    PythonWrapperCodegen.codegen_input_nan_asserts() which checks both despite
+    the config flag being named ``nan_asserts``.
+    """
+
+    wrapper: PythonWrapperCodegen
+    name: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        code.writeline(f"assert not {self.name}.isnan().any().item()")
+        code.writeline(f"assert not {self.name}.isinf().any().item()")
+
+    @staticmethod
+    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+        return converter._generate_nan_assert
+
+
+@dataclasses.dataclass
+class ScalarAssertLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    scalar: sympy.Basic
+    msg: str
+    output_name: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        sizevar = self.wrapper.codegen_python_sizevar(self.scalar, simplify=False)
+        code.writeline(f"if not ({sizevar}):")
+        code.writeline(f"    raise RuntimeError({repr(self.msg)})")
+        code.writeline(f"{self.output_name} = None")
+
+    @staticmethod
+    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+        return converter._generate_scalar_assert
+
+
+@dataclasses.dataclass
 class DynamicScalarLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     node: ir.DynamicScalar
@@ -1592,20 +1670,27 @@ class PythonWrapperCodegen(CodeGen):
             # comparing strides for 0 size tensor is tricky. Ignore them for now.
             if sympy_product(buf.get_size()) == 0:
                 continue
-            size = self.codegen_python_shape_tuple(buf.get_size())
-            stride = self.codegen_python_shape_tuple(buf.get_stride())
-            self._pending_input_asserts[name] = (size, stride)
+
+            self.writeline(
+                SizeAssertLine(
+                    wrapper=self,
+                    name=name,
+                    size=list(buf.get_size()),
+                    stride=list(buf.get_stride()),
+                )
+            )
 
     def codegen_input_nan_asserts(self) -> None:
-        self.prefix.writeline("# make sure graph inputs are not nan/inf")
         for name, buf in self.get_graph_inputs().items():
             if isinstance(buf, (sympy.Expr, ir.TorchBindObject)):
                 continue
 
-            line = f"assert not {name}.isnan().any().item()"
-            self.prefix.writeline(line)
-            line = f"assert not {name}.isinf().any().item()"
-            self.prefix.writeline(line)
+            self.writeline(
+                NanAssertLine(
+                    wrapper=self,
+                    name=name,
+                )
+            )
 
     def write_async_compile_wait(self) -> None:
         self.prefix.splice(
