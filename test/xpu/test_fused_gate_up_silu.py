@@ -1,0 +1,48 @@
+# Owner(s): ["module: intel"]
+
+import torch
+import torch.nn.functional as F
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import run_tests, TestCase
+
+
+class TestFusedGateUpSiLU(TestCase):
+    """Correctness: compare fused kernel vs PyTorch reference."""
+
+    def _reference(self, x, gate_w, up_w):
+        return F.silu(x @ gate_w.T) * (x @ up_w.T)
+
+    def _test_shape_dtype(self, device, M, K, N, dtype):
+        x = torch.randn(M, K, device=device, dtype=dtype)
+        gate_w = torch.randn(N, K, device=device, dtype=dtype)
+        up_w = torch.randn(N, K, device=device, dtype=dtype)
+
+        ref = self._reference(x, gate_w, up_w)
+        out = torch.ops.xpu._fused_gate_up_silu(x, gate_w, up_w)
+
+        # Two valid GEMM implementations (oneDNN vs SYCL-TLA) can differ by
+        # ~0.1% relative (within fp16 ULP).  Since output = SiLU(gate)*up has
+        # large magnitude (gate~70 * up~90 ≈ 6000), small relative GEMM diffs
+        # become large absolute diffs.  Use rtol to accommodate this.
+        rtol, atol = 1e-2, 1.0
+        self.assertTrue(
+            torch.allclose(ref, out, rtol=rtol, atol=atol),
+            f"M={M} K={K} N={N} {dtype} max_diff={(ref - out).abs().max():.6e}",
+        )
+
+    def test_fp16_shapes(self, device):
+        for M in [1, 4, 32, 64, 128]:
+            for K, N in [(512, 1384), (4096, 11008)]:
+                self._test_shape_dtype(device, M, K, N, torch.float16)
+
+    def test_bf16_shapes(self, device):
+        for M in [1, 4, 32, 64, 128]:
+            self._test_shape_dtype(device, M, 512, 1384, torch.bfloat16)
+
+
+instantiate_device_type_tests(
+    TestFusedGateUpSiLU, globals(), only_for="xpu", allow_xpu=True
+)
+
+if __name__ == "__main__":
+    run_tests()
