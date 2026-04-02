@@ -1260,6 +1260,17 @@ def register_op_strategy_map(
         input_strategy = cast(OpStrategy, op_schema.args_schema[0])
         mesh = op_schema.get_mesh_from_args(validate=False)
 
+        # View ops treat _StridedShard literally (dimension mapping), so they
+        # are incompatible with inputs that use _StridedShard as shard-order
+        # encoding. Check once before the strategy loop.
+        for input_placement_strategy in input_strategy.strategies:
+            spec = input_placement_strategy.output_spec
+            if spec.use_strided_shard_as_shard_order:
+                raise NotImplementedError(
+                    "View ops do not support inputs with "
+                    "use_strided_shard_as_shard_order=True"
+                )
+
         global_in_shape = input_strategy.shape
         if global_in_shape is None:
             raise AssertionError("Shape required.")
@@ -1284,12 +1295,17 @@ def register_op_strategy_map(
                 placements=tuple(input_tgt_placements),
                 mesh=mesh,
                 tensor_meta=input_src_spec.tensor_meta,
+                use_strided_shard_as_shard_order=False,
             )
             redistribute_costs: list[list[float]] = [
                 generate_redistribute_costs(input_strategy, input_tgt_spec)
             ]
 
-            output_spec = DTensorSpec(mesh=mesh, placements=tuple(output_placements))
+            output_spec = DTensorSpec(
+                mesh=mesh,
+                placements=tuple(output_placements),
+                use_strided_shard_as_shard_order=False,
+            )
             output_strategy.strategies.append(
                 OpSpec(
                     output_specs=output_spec,

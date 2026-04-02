@@ -107,7 +107,15 @@ class DTensorSpec:
             self.placements = tuple(self.placements)
         if self.use_strided_shard_as_shard_order is None:
             if any(isinstance(p, _StridedShard) for p in self.placements):
-                self.use_strided_shard_as_shard_order = True
+                # Only treat _StridedShard as shard order encoding when it can
+                # actually be decoded as one (i.e. split_factors match mesh dim
+                # size products).  View ops like flatten produce _StridedShard
+                # whose split_factor comes from tensor shapes, not mesh sizes,
+                # so the decode will fail and we correctly default to False.
+                shard_order = DTensorSpec._maybe_convert_StridedShard_to_shard_order(
+                    self.placements, self.mesh
+                )
+                self.use_strided_shard_as_shard_order = shard_order is not None
             else:
                 self.use_strided_shard_as_shard_order = False
         if self.use_strided_shard_as_shard_order:
@@ -760,4 +768,5 @@ class DTensorSpec:
             self.mesh,
             self.placements,
             tensor_meta=tensor_meta,
+            use_strided_shard_as_shard_order=self.use_strided_shard_as_shard_order,
         )
