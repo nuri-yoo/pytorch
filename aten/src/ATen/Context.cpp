@@ -319,6 +319,14 @@ void Context::setImmediateMiopen(bool b) {
   immediate_miopen = b;
 }
 
+bool Context::userEnabledHipdnn() const {
+  return enabled_hipdnn;
+}
+
+void Context::setUserEnabledHipdnn(bool e) {
+  enabled_hipdnn = e;
+}
+
 bool Context::allowTF32CuBLAS() const {
   bool legacy_allow_tf32 = float32_matmul_precision != at::Float32MatmulPrecision::HIGHEST;
   bool allow_tf32_new = float32Precision(Float32Backend::CUDA, Float32Op::MATMUL) == Float32Precision::TF32;
@@ -456,15 +464,7 @@ at::BlasBackend Context::blasPreferredBackend() {
   // Rather than put logic for interpreting what Default means at every
   // call site for blasPreferredBackend(), we set it to an actual value.
   if (blas_preferred_backend == at::BlasBackend::Default) {
-#ifdef USE_ROCM
-    // ROCm - BLAS is default. May change to Lt in the code below.
     blas_preferred_backend = at::BlasBackend::Cublas;
-#else
-    // CUDA - Lt by default if available
-    blas_preferred_backend = hasCuBLASLt()
-      ? at::BlasBackend::Cublaslt
-      : at::BlasBackend::Cublas;
-#endif
     // This logic sits in the getter because it needs to validate
     // values set via env vars such as TORCH_BLAS_PREFER_CUBLASLT
     // which initialize the backend without calling the setter

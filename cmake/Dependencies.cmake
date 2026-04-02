@@ -1078,6 +1078,10 @@ if(USE_ROCM)
 
     set(Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
       hip::amdhip64 MIOpen hiprtc::hiprtc) # libroctx will be linked in with MIOpen
+    if(USE_HIPDNN)
+      list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS hipdnn_frontend)
+      list(APPEND HIP_CXX_FLAGS -DUSE_HIPDNN)
+    endif()
 
     # Math libraries
     list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
@@ -1086,6 +1090,16 @@ if(USE_ROCM)
     if(hipsparselt_FOUND)
       list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
         roc::hipsparselt
+      )
+      if(ROCM_VERSION_DEV VERSION_GREATER_EQUAL "7.12.0")
+          set(CAFFE2_USE_HIPSPARSELT ON)
+      endif()
+    endif()
+
+    # ROCM-SMI needed to support symmetric memory
+    if(USE_DISTRIBUTED AND UNIX)
+      list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
+        rocm_smi64
       )
     endif()
 
@@ -1639,7 +1653,7 @@ if(USE_KINETO)
 
   if(NOT LIBKINETO_NOROCTRACER)
     if("$ENV{ROCM_SOURCE_DIR}" STREQUAL "")
-      set(ENV{ROCM_SOURCE_DIR} "/opt/rocm")
+      set(ENV{ROCM_SOURCE_DIR} "${ROCM_PATH}")
     endif()
   endif()
 

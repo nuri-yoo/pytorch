@@ -209,7 +209,7 @@ class PythonStore : public ::c10d::Store {
   using ::c10d::Store::Store;
 
   // Note: this function manually calls the Python-side overload
-  // for this function instead of using the PYBIND11_OVERLOAD_XYZ
+  // for this function instead of using the PYBIND11_OVERRIDE_XYZ
   // macros. This is done so that we can call the Python-side
   // function with a std::string instead of a std::vector<uint8_t>.
   void set(const std::string& key, const std::vector<uint8_t>& value) override {
@@ -222,7 +222,7 @@ class PythonStore : public ::c10d::Store {
   }
 
   // Note: this function manually calls the Python-side overload
-  // for this function instead of using the PYBIND11_OVERLOAD_XYZ
+  // for this function instead of using the PYBIND11_OVERRIDE_XYZ
   // macros. This is done so that the Python-side function can
   // return a py::bytes instead of a std::vector<uint8_t>.
   std::vector<uint8_t> get(const std::string& key) override {
@@ -239,7 +239,7 @@ class PythonStore : public ::c10d::Store {
   }
 
   // Note: this function manually calls the Python-side overload
-  // for this function instead of using the PYBIND11_OVERLOAD_XYZ
+  // for this function instead of using the PYBIND11_OVERRIDE_XYZ
   // macros. This is done so that the Python-side function can
   // return a py::bytes instead of a std::vector<uint8_t>.
   std::vector<uint8_t> compareSet(
@@ -260,37 +260,37 @@ class PythonStore : public ::c10d::Store {
   }
 
   int64_t add(const std::string& key, int64_t value) override {
-    PYBIND11_OVERLOAD_PURE(int64_t, ::c10d::Store, add, key, value);
+    PYBIND11_OVERRIDE_PURE(int64_t, ::c10d::Store, add, key, value);
   }
 
   int64_t getNumKeys() override {
-    PYBIND11_OVERLOAD_PURE(int64_t, ::c10d::Store, getNumKeys);
+    PYBIND11_OVERRIDE_PURE(int64_t, ::c10d::Store, getNumKeys);
   }
 
   bool deleteKey(const std::string& key) override {
-    PYBIND11_OVERLOAD_PURE(bool, ::c10d::Store, deleteKey, key);
+    PYBIND11_OVERRIDE_PURE(bool, ::c10d::Store, deleteKey, key);
   }
 
   bool check(const std::vector<std::string>& keys) override {
-    PYBIND11_OVERLOAD_PURE(bool, ::c10d::Store, check, keys);
+    PYBIND11_OVERRIDE_PURE(bool, ::c10d::Store, check, keys);
   }
 
   void wait(const std::vector<std::string>& keys) override {
-    PYBIND11_OVERLOAD_PURE(void, ::c10d::Store, wait, keys);
+    PYBIND11_OVERRIDE_PURE(void, ::c10d::Store, wait, keys);
   }
 
   void wait(
       const std::vector<std::string>& keys,
       const std::chrono::milliseconds& timeout) override {
-    PYBIND11_OVERLOAD_PURE(void, ::c10d::Store, wait, keys, timeout);
+    PYBIND11_OVERRIDE_PURE(void, ::c10d::Store, wait, keys, timeout);
   }
 
   c10::intrusive_ptr<Store> clone() override {
-    PYBIND11_OVERLOAD_PURE(c10::intrusive_ptr<Store>, ::c10d::Store, clone);
+    PYBIND11_OVERRIDE_PURE(c10::intrusive_ptr<Store>, ::c10d::Store, clone);
   }
 
   // Note: this function manually calls the Python-side overload
-  // for this function instead of using the PYBIND11_OVERLOAD_XYZ
+  // for this function instead of using the PYBIND11_OVERRIDE_XYZ
   // macros. This is done so that we can call the Python-side
   // function with a std::string instead of a std::vector<uint8_t>.
   void append(const std::string& key, const std::vector<uint8_t>& value)
@@ -339,7 +339,7 @@ class PythonStore : public ::c10d::Store {
   }
 
   bool hasExtendedApi() const override {
-    PYBIND11_OVERLOAD_NAME(
+    PYBIND11_OVERRIDE_NAME(
         bool, ::c10d::Store, "has_extended_api", hasExtendedApi);
   }
 };
@@ -574,7 +574,8 @@ An enum-like class for built-in communication hooks: ``ALLREDUCE`` and ``FP16_CO
                  int64_t first_bucket_bytes_cap,
                  bool skip_all_reduce_unused_params,
                  bool use_python_reducer,
-                 std::vector<int64_t> bucket_bytes_cap_list) {
+                 std::vector<int64_t> bucket_bytes_cap_list,
+                 bool batched_grad_copy) {
                 // gil_scoped_release is not safe as a call_guard in init.
                 // https://github.com/pybind/pybind11/issues/5473
                 py::gil_scoped_release nogil{};
@@ -591,7 +592,8 @@ An enum-like class for built-in communication hooks: ``ALLREDUCE`` and ``FP16_CO
                     first_bucket_bytes_cap,
                     skip_all_reduce_unused_params,
                     use_python_reducer,
-                    std::move(bucket_bytes_cap_list));
+                    std::move(bucket_bytes_cap_list),
+                    batched_grad_copy);
               }),
           py::arg("params"),
           py::arg("bucket_indices"),
@@ -606,7 +608,8 @@ An enum-like class for built-in communication hooks: ``ALLREDUCE`` and ``FP16_CO
           py::arg("first_bucket_bytes_cap") = ::c10d::kDefaultFirstBucketBytes,
           py::arg("skip_all_reduce_unused_params") = false,
           py::arg("use_python_reducer") = false,
-          py::arg("bucket_bytes_cap_list") = std::vector<int64_t>())
+          py::arg("bucket_bytes_cap_list") = std::vector<int64_t>(),
+          py::arg("batched_grad_copy") = false)
       .def(
           "prepare_for_forward",
           &::c10d::Reducer::prepare_for_forward,
@@ -3156,7 +3159,15 @@ Arguments:
               py::arg("device"),
               py::call_guard<py::gil_scoped_release>())
           .def_property_readonly(
-              "mem_allocator", &::c10d::Backend::getMemAllocator);
+              "mem_allocator", &::c10d::Backend::getMemAllocator)
+          .def("suspend", &::c10d::Backend::suspend)
+          .def("resume", &::c10d::Backend::resume)
+          .def("memory_stats", &::c10d::Backend::getMemoryStats, R"(
+            Get the memory statistics of the backend.
+
+            Returns:
+              A dictionary containing the memory statistics.
+            )");
 
   // base Backend::Options binding
   // TODO: Maybe we can consider how to merge this with
