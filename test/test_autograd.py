@@ -15447,22 +15447,13 @@ class TestSelectiveActivationCheckpoint(TestCase):
                 "Model.layers.1_my_op_2",
             }
 
-            fwd_decisions: list = []
-            fwd_idx = [0]
-
             def policy_fn(ctx, op, *args, **kwargs):
-                if ctx.is_recompute:
-                    decision = fwd_decisions[fwd_idx[0]]
-                    fwd_idx[0] += 1
-                    return decision
                 out = ctx.op_output
-                decision = CheckpointPolicy.PREFER_RECOMPUTE
                 if isinstance(out, torch.Tensor):
                     name = naming.names.get(out)
                     if name in save_names:
-                        decision = CheckpointPolicy.MUST_SAVE
-                fwd_decisions.append(decision)
-                return decision
+                        return CheckpointPolicy.MUST_SAVE
+                return CheckpointPolicy.PREFER_RECOMPUTE
 
             x = torch.randn(4, requires_grad=True)
             context_fn = functools.partial(
@@ -15500,23 +15491,14 @@ class TestSelectiveActivationCheckpoint(TestCase):
             mod = Model()
             naming = _AutoNamingMode()
 
-            fwd_decisions: list = []
-            fwd_idx = [0]
-
             def policy_fn(ctx, op, *args, **kwargs):
-                if ctx.is_recompute:
-                    decision = fwd_decisions[fwd_idx[0]]
-                    fwd_idx[0] += 1
-                    return decision
                 out = ctx.op_output
-                decision = CheckpointPolicy.PREFER_RECOMPUTE
                 if isinstance(out, torch.Tensor):
                     name = naming.names.get(out)
                     # Save only the second call (count=1) in block b
                     if name == "Model.b_my_op_1":
-                        decision = CheckpointPolicy.MUST_SAVE
-                fwd_decisions.append(decision)
-                return decision
+                        return CheckpointPolicy.MUST_SAVE
+                return CheckpointPolicy.PREFER_RECOMPUTE
 
             x = torch.randn(4, requires_grad=True)
             context_fn = functools.partial(
