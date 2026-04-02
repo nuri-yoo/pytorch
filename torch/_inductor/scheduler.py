@@ -1653,6 +1653,18 @@ class SchedulerNode(BaseSchedulerNode):
 
         self.refresh_dependencies(normalize=False, need_clear_tiling_cache=True)
 
+    def apply_loop_reindexing(self, new_iter_sizes: Sequence[sympy.Expr]) -> None:
+        assert isinstance(self.node, (ir.ComputedBuffer, ir.TemplateBuffer))
+
+        self._body = self._body.reindex_iter_loops(new_iter_sizes)
+        self._sizes = self._body.sizes
+
+        device = self.node.get_device_or_error()
+        group_fn = self.scheduler.get_backend(device).group_fn
+        self.group = (device, group_fn(self._sizes))
+
+        self.refresh_dependencies(normalize=False, need_clear_tiling_cache=True)
+
     def swap_pw_red_dimension(self) -> None:
         num_rdims = self._body.get_original_num_rdims()
         num_pwdims = len(self._body.iter_vars) - num_rdims
@@ -5541,17 +5553,46 @@ class Scheduler:
         if node1.is_template() or node2.is_template():
             return -1
 
-        node1_buffer_names = node1.read_writes.buffer_names()
-        node2_buffer_names = node2.read_writes.buffer_names()
-        # Fast path: no common buffers.
-        common_buffer_names = node1_buffer_names & node2_buffer_names
+        common_buffer_names = (
+            node1.read_writes.buffer_names() & node2.read_writes.buffer_names()
+        )
         if not common_buffer_names:
             return -1
 
+        score = self._try_reorder_loops_for_candidates(node1, node2)
+        if score >= 0:
+            return score
+
+        # No reordering candidates found. Try reindexing the pointwise
+        # to match the reduction's iteration domain (e.g., [1024, 8192] ->
+        # [65536, 128] for RMS norm with reshape), then retry loop reordering.
+        if (
+            not config.loop_reindexing_after_fusion
+            or not self._try_reindex_pointwise_for_reduction(node1, node2)
+        ):
+            return -1
+
+        score = self._try_reorder_loops_for_candidates(node1, node2)
+        if score >= 0:
+            return score
+
+        return typing.cast(int, self.score_fusion_memory(node1, node2))
+
+    def _try_reorder_loops_for_candidates(
+        self,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+    ) -> int:
+        """
+        Find common buffers with matching normalized stride order but different
+        loop orders, and try to reorder loops to align them.
+        """
+        common_buffer_names = (
+            node1.read_writes.buffer_names() & node2.read_writes.buffer_names()
+        )
         node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
         node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
 
-        # Find the commons buffers that has different loop orders
         candidates = []
         for buffer_name in common_buffer_names:
             lhs_dep = node1_name2dep[buffer_name]
@@ -5606,6 +5647,65 @@ class Scheduler:
             if reordered
             else -1
         )
+
+    def _try_reindex_pointwise_for_reduction(
+        self,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+    ) -> bool:
+        """
+        Reindex a pointwise's iteration loops to match a reduction's
+        groups. After reindexing, the shared reads have identical index
+        expressions, enabling the codegen to CSE loads.
+
+        Returns True if reindexing was applied.
+        """
+        from .codegen.simd import SIMDKernel
+
+        if node1.is_reduction() and not node2.is_reduction():
+            reduction_node, pw_node = node1, node2
+        elif node2.is_reduction() and not node1.is_reduction():
+            reduction_node, pw_node = node2, node1
+        else:
+            return False
+
+        _, groups = reduction_node.group
+        red_numel = typing.cast(sympy.Expr, groups[0])
+        red_rnumel = typing.cast(sympy.Expr, groups[1])
+        target_numel = red_numel * red_rnumel
+
+        if not all(isinstance(sn, SchedulerNode) for sn in pw_node.get_nodes()):
+            return False
+        snodes = typing.cast(list[SchedulerNode], pw_node.get_nodes())
+
+        # All snodes must have the same total iteration numel matching
+        # the reduction's numel * rnumel so they can be reindexed identically.
+        if not all(
+            V.graph.sizevars.statically_known_equals(
+                sympy_product(sn._sizes[0]), target_numel
+            )
+            for sn in snodes
+        ):
+            return False
+
+        if not all(
+            SIMDKernel.is_compatible((red_numel, red_rnumel), sn.get_ranges())
+            for sn in snodes
+        ):
+            return False
+
+        # TODO: both reindexing and loop reordering mutate nodes in place
+        # before we know whether fusion will actually succeed. If a later
+        # check in can_fuse rejects the fusion, the node is left modified.
+        # We should validate that fusion will succeed, or support rollback.
+        for sn in snodes:
+            sn.apply_loop_reindexing([red_numel, red_rnumel])
+
+        if isinstance(pw_node, FusedSchedulerNode):
+            pw_node.group = snodes[0].group
+            refresh_group_node_dependencies(pw_node)
+
+        return True
 
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
         """

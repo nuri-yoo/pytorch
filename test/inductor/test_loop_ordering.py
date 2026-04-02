@@ -416,6 +416,75 @@ class LoopOrderingTest(TestCase):
         self.do_acc_test(f, x)
         self.assertEqual(1, metrics.generated_kernel_count)
 
+    def test_reshape_reindexing_for_reduction(self):
+        """
+        RMS norm pattern where reshape(-1, head_dim) changes the loop
+        decomposition from [M, N] to [M*num_heads, head_dim]. Without
+        reindexing, the pointwise and reduction have different MemoryDep
+        indexing and can't fuse. With reindexing, the pointwise's
+        iteration is re-factored to match the reduction's, enabling fusion
+        into a single kernel.
+        """
+
+        def f(x):
+            head_dim = 128
+            M, N = x.shape
+            x_reshaped = x.reshape(-1, head_dim)
+            x_f32 = x_reshaped.float()
+            variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
+            x_normed = x_f32 * torch.rsqrt(variance + 1e-5)
+            return x_normed.reshape(M, N).to(x.dtype)
+
+        if DO_PERF_TEST:
+            M = 1024
+        else:
+            M = 16
+        # Non-contiguous input (simulating a slice from qkv projection)
+        qkv = torch.randn(M, 10240, dtype=torch.bfloat16)
+        x = qkv[:, :8192]
+
+        ref = f(x)
+        actual = torch.compile(f)(x)
+        torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)
+        self.assertEqual(1, metrics.generated_kernel_count)
+
+        if DO_PERF_TEST:
+            from triton.testing import do_bench
+
+            optf = torch.compile(f)
+            print(f"ms={do_bench(lambda: optf(x))}")
+
+    def test_reshape_reindexing_fused_pointwise(self):
+        """
+        Redecomposition where the pointwise side is a FusedSchedulerNode.
+        realize() forces ops to materialize as separate nodes, so
+        add and clamp become two SchedulerNodes that fuse into a
+        FusedSchedulerNode before the reindexing fuses them with
+        the reduction.
+        """
+
+        def f(x, bias):
+            head_dim = 128
+            M, N = x.shape
+            y = realize(x + bias)
+            z = realize(y.clamp(-1, 1))
+            x_reshaped = z.reshape(-1, head_dim)
+            x_f32 = x_reshaped.float()
+            variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
+            x_normed = x_f32 * torch.rsqrt(variance + 1e-5)
+            return x_normed.reshape(M, N).to(x.dtype)
+
+        M = 16
+        qkv = torch.randn(M, 10240, dtype=torch.bfloat16)
+        x = qkv[:, :8192]
+        bias = torch.randn(8192, dtype=torch.bfloat16)
+
+        ref = f(x, bias)
+        actual = torch.compile(f)(x, bias)
+        torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)
+        self.assertEqual(1, metrics.generated_kernel_count)
+        torch._dynamo.reset()
+
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, "FP8 requires H100+ and MI300+")
     @unittest.skipIf(not SM90OrLater, "sm89 errors out on this test")
     def test_fp8_cast_and_t(self):
