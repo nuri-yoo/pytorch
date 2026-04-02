@@ -1,12 +1,20 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+from typing import Any
+
 import torch
+from torch.distributed.tensor._dtensor_spec import TensorMeta
 from torch.distributed.tensor._op_schema import (
     OpSchema,
     OpSpec,
     OpStrategy,
     StrategyType,
 )
+from torch.distributed.tensor._ops.single_dim_strategy import (
+    _ShardingPlaceholder,
+    register_single_dim_strategy,
+)
 from torch.distributed.tensor._ops.utils import is_tensor_partial, register_op_strategy
+from torch.distributed.tensor.placement_types import Placement
 
 
 aten = torch.ops.aten
@@ -41,3 +49,19 @@ def random_op_strategy(op_schema: OpSchema) -> StrategyType:
         )
 
     return random_strategy
+
+
+@register_single_dim_strategy([aten.uniform.default])
+def uniform_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    input_meta = args_schema[0]
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    # [output, input] — element-independent, any shard maps to same shard
+    return [
+        [_ShardingPlaceholder(d), _ShardingPlaceholder(d)]
+        for d in range(len(input_meta.shape))
+    ]
