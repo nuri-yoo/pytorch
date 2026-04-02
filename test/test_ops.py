@@ -1609,7 +1609,6 @@ class TestCommon(TestCase):
 
     # Validates that each OpInfo specifies its forward and backward dtypes
     #   correctly for CPU and CUDA devices
-    @skipXPU
     @skipMeta
     @skipIfRocm(msg="Fails with Triton 3.7")
     @onlyNativeDeviceTypesAnd(["hpu"])
