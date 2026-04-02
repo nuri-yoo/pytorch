@@ -1,9 +1,18 @@
 # Owner(s): ["module: intel"]
+import unittest
 
 import torch
 import torch.nn.functional as F
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_xpu import get_xpu_codename, XPUCodename
+
+
+def check_if_pvc() -> bool:
+    xpu_codename = get_xpu_codename()
+    if xpu_codename == XPUCodename.PVC:
+        return True
+    return False
 
 
 class TestFusedGateUpSiLU(TestCase):
@@ -31,6 +40,7 @@ class TestFusedGateUpSiLU(TestCase):
             for K, N in [(512, 1384), (4096, 11008)]:
                 self._test_shape_dtype(device, M, K, N, torch.float16)
 
+    @unittest.skipIf(check_if_pvc(), "PVC not available")
     def test_bf16_shapes(self, device):
         for M in [1, 4, 32, 64, 128]:
             self._test_shape_dtype(device, M, 512, 1384, torch.bfloat16)
