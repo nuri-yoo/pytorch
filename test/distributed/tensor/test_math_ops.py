@@ -605,7 +605,12 @@ class DistMathOpsTest(DTensorTestBase):
                 with CommDebugMode() as comm_mode:
                     output_dist = model_dist(x)
 
-                self.assertEqual(output_local, output_dist)
+                output_dist_cmp = (
+                    output_dist.full_tensor()
+                    if isinstance(output_dist, DTensor)
+                    else output_dist
+                )
+                self.assertEqual(output_local, output_dist_cmp)
 
                 # all requires_grad patterns should have the same forward comm counts
                 expected_fwd_comm = {
@@ -645,7 +650,12 @@ class DistMathOpsTest(DTensorTestBase):
                     comm_mode.comm_module_counts["Global"]["backward"],
                     expected_bwd_comm,
                 )
-                self.assertEqual(output_local, output_dist)
+                output_dist_cmp = (
+                    output_dist.full_tensor()
+                    if isinstance(output_dist, DTensor)
+                    else output_dist
+                )
+                self.assertEqual(output_local, output_dist_cmp)
 
             except Exception as e:
                 subtest_fails[subtest_cfg] = e
@@ -678,9 +688,41 @@ class DistMathOpsTest(DTensorTestBase):
             out_full_values = out_dt.values.full_tensor()
             self.assertEqual(global_topk.values, out_full_values)
 
-            # TODO: support backward scatter
-            # global_topk.values.sum().backward()
-            # out_full_values.sum().backward()
+    @with_comms
+    def test_topk_backward(self):
+        device_mesh = self.build_device_mesh()
+        # Test backward for topk with various shard_dim / topk_dim combinations.
+        # The fix in value_selecting_reduction_backward ensures that the zeros
+        # tensor created during backward is properly dispatched through DTensor
+        # (using new_zeros instead of at::zeros).
+        topk_dims = [0, 1, -1]
+        shard_dims = [0, 1, 2]
+        for topk_dim, shard_dim in itertools.product(topk_dims, shard_dims):
+            # Reference: plain (non-distributed) backward
+            x = torch.randn(12, 8, 8, device=self.device_type, requires_grad=True)
+            ref_topk = x.topk(3, dim=topk_dim)
+            ref_topk.values.sum().backward()
+
+            # Distributed backward
+            dist_x = distribute_tensor(
+                x.detach().clone().requires_grad_(True),
+                device_mesh,
+                [Shard(shard_dim)],
+            )
+            dist_topk = dist_x.topk(3, dim=topk_dim)
+            dist_topk.values.sum().backward()
+
+            # Verify gradient exists, has the right placement, and matches
+            self.assertIsNotNone(
+                dist_x.grad,
+                msg=f"topk_dim={topk_dim}, shard_dim={shard_dim}",
+            )
+            self.assertEqual(
+                dist_x.grad.full_tensor(),
+                x.grad,
+                msg=f"topk_dim={topk_dim}, shard_dim={shard_dim}",
+            )
+            x.grad.zero_()
 
     @with_comms
     def test_shard0_svd(self):
@@ -1274,7 +1316,9 @@ class DistMathOpsTest(DTensorTestBase):
         dt = dt.redistribute(dt.device_mesh, placements=[Replicate()])
         out_with_redistribute = torch.norm(dt)
 
-        self.assertEqual(out_without_redistribute, out_with_redistribute)
+        self.assertEqual(
+            out_without_redistribute.full_tensor(), out_with_redistribute.full_tensor()
+        )
 
         local_tensor = torch.rand(3, dtype=torch.float32, device=self.device_type)
         dt = DTensor.from_local(
@@ -1285,7 +1329,9 @@ class DistMathOpsTest(DTensorTestBase):
         dt = dt.redistribute(dt.device_mesh, placements=[Replicate()])
         out_with_redistribute = torch.max(dt)
 
-        self.assertEqual(out_without_redistribute, out_with_redistribute)
+        self.assertEqual(
+            out_without_redistribute.full_tensor(), out_with_redistribute.full_tensor()
+        )
 
         local_tensor = torch.rand(3, dtype=torch.float32, device=self.device_type)
         dt = DTensor.from_local(
@@ -1296,7 +1342,9 @@ class DistMathOpsTest(DTensorTestBase):
         dt = dt.redistribute(dt.device_mesh, placements=[Replicate()])
         out_with_redistribute = torch.min(dt)
 
-        self.assertEqual(out_without_redistribute, out_with_redistribute)
+        self.assertEqual(
+            out_without_redistribute.full_tensor(), out_with_redistribute.full_tensor()
+        )
 
     @with_comms
     def test_matching_partial_reduction_ops(self):
@@ -1315,7 +1363,9 @@ class DistMathOpsTest(DTensorTestBase):
 
         self.assertTrue(out_without_redistribute.placements[0].is_partial())
         self.assertTrue(out_with_redistribute.placements[0].is_replicate())
-        self.assertEqual(out_without_redistribute, out_with_redistribute)
+        self.assertEqual(
+            out_without_redistribute.full_tensor(), out_with_redistribute.full_tensor()
+        )
 
     @skip_if_lt_x_gpu(4)
     @with_comms

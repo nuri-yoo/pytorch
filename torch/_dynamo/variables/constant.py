@@ -177,10 +177,24 @@ its type to `common_constant_types`.
         except TypeError as e:
             raise NotImplementedError from e
 
+    def len_impl(self, tx: "InstructionTranslator") -> "VariableTracker":
+        """Generic len for any constant value (sequence or mapping)."""
+        try:
+            return ConstantVariable.create(len(self.value))
+        except TypeError as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+    def sq_length(self, tx: "InstructionTranslator") -> "VariableTracker":
+        """Sequence length - delegates to len_impl for constants."""
+        return self.len_impl(tx)
+
+    def mp_length(self, tx: "InstructionTranslator") -> "VariableTracker":
+        """Mapping length - delegates to len_impl for constants."""
+        return self.len_impl(tx)
+
     def const_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
         if not hasattr(self.value, name):
-            name_variable = variables.ConstantVariable.create(name)
-            raise_observed_exception(AttributeError, tx, args=[name_variable])
+            raise_observed_exception(AttributeError, tx, args=[name])
         member = getattr(self.value, name)
         if callable(member):
             raise NotImplementedError
@@ -248,7 +262,7 @@ its type to `common_constant_types`.
                     raise_observed_exception(
                         type(exc),
                         tx,
-                        args=list(map(ConstantVariable.create, exc.args)),
+                        args=list(exc.args),
                     )
             if (
                 hasattr(operator, name)
@@ -269,9 +283,7 @@ its type to `common_constant_types`.
                     try:
                         return ConstantVariable.create(op(self.value, add_target))
                     except Exception as e:
-                        raise_observed_exception(
-                            type(e), tx, args=list(map(ConstantVariable.create, e.args))
-                        )
+                        raise_observed_exception(type(e), tx, args=list(e.args))
         elif isinstance(self.value, bytes) and name == "decode":
             method = getattr(self.value, name)
             return ConstantVariable.create(method(*const_args, **const_kwargs))
@@ -282,20 +294,13 @@ its type to `common_constant_types`.
             except Exception as e:
                 raise_observed_exception(type(e), tx)
 
-        if name == "__len__" and not (args or kwargs):
-            try:
-                return ConstantVariable.create(len(self.value))
-            except TypeError as e:
-                raise_observed_exception(type(e), tx, args=list(e.args))
-        elif name == "__round__" and len(args) == 1 and args[0].is_python_constant():
+        if name == "__round__" and len(args) == 1 and args[0].is_python_constant():
             try:
                 return ConstantVariable.create(
                     round(self.value, args[0].as_python_constant())
                 )
             except Exception as e:
-                raise_observed_exception(
-                    type(e), tx, args=list(map(ConstantVariable.create, e.args))
-                )
+                raise_observed_exception(type(e), tx, args=list(e.args))
         elif name == "__contains__" and len(args) == 1 and args[0].is_python_constant():
             assert not kwargs
             search = args[0].as_python_constant()
@@ -303,9 +308,7 @@ its type to `common_constant_types`.
                 result = search in self.value
                 return ConstantVariable.create(result)
             except TypeError as e:
-                raise_observed_exception(
-                    type(e), tx, args=list(map(ConstantVariable.create, e.args))
-                )
+                raise_observed_exception(type(e), tx, args=list(e.args))
         return super().call_method(tx, name, args, kwargs)
 
     def call_tree_map(
@@ -386,6 +389,16 @@ its type to `common_constant_types`.
 
     def get_real_python_backed_value(self) -> object:
         return self.value
+
+    def nb_index_impl(
+        self,
+        tx: Any,
+    ) -> "VariableTracker":
+        # CPython: int and bool define nb_index (returns self for int,
+        # int(self) for bool). All other constant types do not.
+        if isinstance(self.value, (int, bool)):
+            return ConstantVariable.create(operator.index(self.value))
+        return super().nb_index_impl(tx)
 
 
 CONSTANT_VARIABLE_NONE = ConstantVariable(None)
