@@ -42,8 +42,8 @@ void eval_frame_callback_set(PyObject* obj) {
   PyThread_tss_set(&eval_frame_callback_key, obj);
 }
 
-// 3.15 Not supported at all. See cpython_defs.c for hints
-#if !(IS_PYTHON_3_15_PLUS)
+// 3.16 Not supported at all. See cpython_defs.c for hints
+#if !(IS_PYTHON_3_16_PLUS)
 
 #define DECLARE_PYOBJ_ATTR(name)                        \
   static PyObject* THPPyInterpreterFrame_##name(        \
