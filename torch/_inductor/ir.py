@@ -7515,8 +7515,6 @@ class UserDefinedTritonKernel(ExternKernel):
         # In these edge cases, our fusion is only correct if the original tensor is empty,
         # where the semantics is that content values are UB, and we can rely on the fact that `epilogue(UB) == UB`.
         assert len(self.mutable_args) == 1
-        if self.mutable_args[0].get_inputs_that_alias_output():
-            return False
         if not isinstance(self.mutable_args[0], TensorBox):
             return False
         if not isinstance(self.mutable_args[0].data, StorageBox):

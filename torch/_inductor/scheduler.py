@@ -5830,13 +5830,13 @@ class Scheduler:
             if not isinstance(node1.node, ir.UserDefinedTritonKernel):
                 why("node1 is extern but not a triton kernel")
                 return False
-            written_buffer_name = node1.node.mutation_outputs[0].name
-            if written_buffer_name in self.mutation_renames:
-                why("output buffer involved in buffer reuse")
-                return False
 
             if not node1.node.can_fuse_epilogue():
                 why("node1's triton kernel doesn't support epilogue fusion")
+                return False
+
+            if len(node1.unmet_dependencies) != 1:
+                why("node1 has unexpected unmet dependencies, unsafe to epilogue fuse")
                 return False
 
             if not isinstance(node2, SchedulerNode):
@@ -5849,22 +5849,30 @@ class Scheduler:
                 why("node1 is extern but node2.node.data is not Pointwise")
                 return False
 
+            assert len(node1.node.mutation_outputs) == 1
+            written_buffer_name = node1.node.mutation_outputs[0].name
+
+            # The epilogue can only reference the mutated output buffer.
+            # Any other reads would inject inductor variable names that don't
+            # exist in the user kernel's scope
+            if any(dep.name != written_buffer_name for dep in node2.read_writes.reads):
+                why("epilogue reads from buffers other than the mutated output")
+                return False
+
             # the epilogue depends on expressions which may not available in the user triton kernel
             # (e.g. indexing exprs used not in a load)
-            node2_inner_fn_free_symbols = node2.node.data.inner_fn_free_symbols()
-            for symbol in node2_inner_fn_free_symbols:
-                usages = node2.node.data.collect_inner_fn_symbol_usage(symbol)
-                if any(usage != "load" for usage in usages):
-                    return False
+            if any(
+                any(usage != "load" for usage in node2.node.data.collect_inner_fn_symbol_usage(sym))
+                for sym in node2.node.data.inner_fn_free_symbols()
+            ):
+                why("epilogue uses indexing variables outside of loads")
+                return False
 
             # should be true now because we checked `can_fuse_epilogue`
             assert len(node1.node.mutable_args) == 1
             if node1.node.mutable_args[0].layout != node2.node.layout:
                 why("node1 and node2 uses different buf layouts")
                 return False
-
-            assert len(node1.node.mutation_outputs) == 1
-            written_buffer_name = node1.node.mutation_outputs[0].name
 
             def _is_other_node_that_references_mutation_buffer(
                 other_node: BaseSchedulerNode,
@@ -6053,7 +6061,7 @@ class Scheduler:
             remaining_deps_by_name[name].append(dep)
 
         for cd in node1.read_writes.writes:
-            if not isinstance(cd, MemoryDep) and not isinstance(cd, UserTritonDep):
+            if not isinstance(cd, MemoryDep) and not isinstance(cd, (StarDep, UserTritonDep)):
                 continue
             remaining = remaining_deps_by_name.get(
                 self.mutation_renames.get(cd.name, cd.name)
@@ -6189,9 +6197,8 @@ class Scheduler:
                 return True
         return False
 
-    # FIXME: Moving away from StarDep
     # on tensors that are "empty" (i.e. with undefined values),
-    # we relax the conditions for fusion and additionally allow matching a writing StarDep with any read dep.
+    # we relax the conditions for fusion and additionally allow matching a writing UserTritonDep with any read dep.
     # This makes use of the fact that `f(UB) = UB`.
     def fusable_usertritondep_write_and_read_on_empty_tensor(
         self, read: Dep, write: UserTritonDep, writing_node: ir.Operation | None
@@ -6202,7 +6209,7 @@ class Scheduler:
             return False
         read_name = self.mutation_renames.get(read.name, read.name)
         write_name = self.mutation_renames.get(write.name, write.name)
-        return read_name == write_name
+        return isinstance(write, UserTritonDep) and read_name == write_name
 
     def dep_size_hint(self, dep: Dep, count_bytes: bool = True) -> int:
         return V.graph.get_dep_size_hint(dep, count_bytes)
