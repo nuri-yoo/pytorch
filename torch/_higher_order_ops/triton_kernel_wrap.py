@@ -2252,10 +2252,6 @@ class TraceableTritonKernelWrapper:
         return arg
 
 
-# TODO: - Class level caching.
-#       - Move get_tma_stores here.
-#       - Document:
-#           - op_int_attrs will raise in symbolic
 class KernelAccessAnalyzer:
     def __init__(
         self,
@@ -2473,11 +2469,15 @@ class KernelAccessAnalyzer:
             if self.extract_symbolic:
                 try:
                     self._symbolic.traverse(sink, ops, accesses)  # type: ignore[union-attr]
+                except SymbolicFailure as e:
+                    log.debug(
+                        "Symbolic analysis failed at op '%s', switching to conservative",
+                        e.op_name,
+                    )
+                    self.extract_symbolic = False
+                    conservative.traverse(sink, ops, accesses, skip_loads)
                 except Exception:
-                    # log.debug(
-                    #     "Symbolic analysis failed at op '%s', switching to conservative",
-                    #     e.op_name,
-                    # )
+                    log.debug("Symbolic analysis failed, switching to conservative")
                     self.extract_symbolic = False
                     conservative.traverse(sink, ops, accesses, skip_loads)
             else:
@@ -2492,7 +2492,6 @@ class KernelAccessAnalyzer:
         from torch._inductor.dependencies import Dep, ReadWrites, UserTritonDep
         from torch.utils._ordered_set import OrderedSet
 
-        # TODO: Change to MemoryDep or introduce new UserTritonDep.
         writes: OrderedSet[Dep]
         reads: OrderedSet[Dep]
         if self.extract_symbolic:
@@ -2873,7 +2872,6 @@ class SymbolicAnalyzer:
         return self._build_expr(op.args[0])
 
     def _handle_shape_context(self, op: Op) -> sympy.Expr:
-        # TODO: Document
         out_shape = op.get_list_attr("out_shape")
         prev_shape = self.current_shape
         self.current_shape = out_shape

@@ -5130,10 +5130,6 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
 
 def make_kernel_access_analyzer_test(fn):
-    """
-    READS then WRITES
-    """
-
     @requires_gpu
     def test_fn(self):
         from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
