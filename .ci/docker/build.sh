@@ -294,6 +294,10 @@ case "$tag" in
         ANACONDA_PYTHON_VERSION=${ANACONDA_PYTHON_VERSION%?}
         PYTHON_FREETHREADED=1
       fi
+      if [[ "$ANACONDA_PYTHON_VERSION" == "3.15" ]]
+      then
+        PYTHON_DEV_CHANNEL=1
+      fi
     fi
     if [[ "$image" == *cuda* ]]; then
       extract_version_from_image_name cuda CUDA_VERSION
@@ -347,6 +351,7 @@ docker buildx build \
        --build-arg "CLANG_VERSION=${CLANG_VERSION}" \
        --build-arg "ANACONDA_PYTHON_VERSION=${ANACONDA_PYTHON_VERSION}" \
        --build-arg "PYTHON_FREETHREADED=${PYTHON_FREETHREADED}" \
+       --build-arg "PYTHON_DEV_CHANNEL=${PYTHON_DEV_CHANNEL}" \
        --build-arg "PYTHON_VERSION=${PYTHON_VERSION}" \
        --build-arg "GCC_VERSION=${GCC_VERSION}" \
        --build-arg "CUDA_VERSION=${CUDA_VERSION}" \

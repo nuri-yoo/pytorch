@@ -55,9 +55,17 @@ if [ -n "$ANACONDA_PYTHON_VERSION" ]; then
   else
     PYTHON_DEP="python=${ANACONDA_PYTHON_VERSION}"
   fi
+
+  CONDA_CHANNEL_ARGS=""
+  if [[ $PYTHON_DEV_CHANNEL == "1" ]]
+  then
+    CONDA_CHANNEL_ARGS="-c conda-forge/label/python_dev -c conda-forge/label/python_rc"
+  fi
+
   # Install correct Python version
   # Also ensure sysroot is using a modern GLIBC to match system compilers
   as_jenkins conda create -n py_$ANACONDA_PYTHON_VERSION -y\
+             ${CONDA_CHANNEL_ARGS} \
              ${PYTHON_DEP} \
              ${SYSROOT_DEP} \
              "icu<78"
