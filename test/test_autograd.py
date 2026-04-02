@@ -20,7 +20,7 @@ import unittest
 import uuid
 import warnings
 import weakref
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 from copy import deepcopy
 from functools import partial, reduce
 from itertools import product
@@ -86,6 +86,7 @@ from torch.testing._internal.common_utils import (
 )
 from torch.utils._mode_utils import no_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils.weak import WeakTensorKeyDictionary
 from torch.utils.checkpoint import (
     checkpoint,
     checkpoint_sequential,
@@ -14926,6 +14927,75 @@ class TestNestedCheckpoint(TestCase):
         self.assertEqual(counter[0], 1)
 
 
+@contextlib.contextmanager
+def _counter_op(name):
+    """Yields (op, counts) where op is a custom op that counts invocations."""
+    counts = [0]
+    with torch.library._scoped_library("test_ckpt", "FRAGMENT"):
+
+        @torch.library.custom_op(f"test_ckpt::{name}", mutates_args=())
+        def op(x: torch.Tensor) -> torch.Tensor:
+            counts[0] += 1
+            return x.sin()
+
+        @op.register_fake
+        def _(x):
+            return torch.empty_like(x)
+
+        def setup_context(ctx, inputs, output):
+            ctx.save_for_backward(inputs[0])
+
+        def backward(ctx, grad):
+            (x,) = ctx.saved_tensors
+            return grad * x.cos()
+
+        op.register_autograd(backward, setup_context=setup_context)
+
+        yield op, counts
+
+
+class _AutoNamingMode(TorchDispatchMode):
+    """Test helper: names output tensors as ``fqn_op_count[_outputidx]``."""
+
+    def __init__(self):
+        from torch.utils.module_tracker import ModuleTracker
+        self._tracker = ModuleTracker()
+        self._func_counter: dict = defaultdict(int)
+        self.names = WeakTensorKeyDictionary()
+
+    def __enter__(self):
+        self._tracker.__enter__()
+        return super().__enter__()
+
+    def __exit__(self, *args):
+        self._tracker.__exit__(*args)
+        return super().__exit__(*args)
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        parents = self._tracker.parents - {"Global"}
+        fqn = max(parents, key=len) if parents else "Global"
+        op_name = (
+            func.__name__.split(".")[0] if hasattr(func, "__name__") else str(func)
+        )
+        key = (fqn, func)
+        count = self._func_counter[key]
+        self._func_counter[key] += 1
+        multi_output = isinstance(out, (tuple, list)) and sum(
+            isinstance(o, torch.Tensor) for o in out
+        ) > 1
+        if isinstance(out, torch.Tensor):
+            self.names[out] = f"{fqn}_{op_name}_{count}"
+        elif isinstance(out, (tuple, list)):
+            for i, o in enumerate(out):
+                if isinstance(o, torch.Tensor):
+                    name = f"{fqn}_{op_name}_{count}"
+                    if multi_output:
+                        name += f"_{i}"
+                    self.names[o] = name
+        return out
+
+
 class TestSelectiveActivationCheckpoint(TestCase):
     @unittest.skipIf(not TEST_CUDA, "requires CUDA")
     def test_flops_and_mem(self):
@@ -15344,6 +15414,123 @@ class TestSelectiveActivationCheckpoint(TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Trying to backward an extra time"):
             out.sum().backward(retain_graph=True)
+
+    @skipIfTorchDynamo("torch dispatch modes don't support compile")
+    def test_auto_naming_mode_names(self):
+        # Use AutoNamingMode names to selectively save specific invocations
+        # of the same op across a multi-layer module hierarchy. The policy
+        # records decisions during forward and replays them during recompute.
+        with _counter_op("my_op") as (my_op, my_count):
+
+            class Block(torch.nn.Module):
+                def forward(self, x):
+                    # Three calls per block: counts 0, 1, 2
+                    return my_op(my_op(my_op(x)))
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.layers = torch.nn.ModuleList([Block(), Block()])
+
+                def forward(self, x):
+                    for layer in self.layers:
+                        x = layer(x)
+                    return x
+
+            mod = Model()
+            naming = _AutoNamingMode()
+
+            save_names = {
+                # Save the 1st call in layer 0 and the 0th and 2nd in layer 1
+                "Model.layers.0_my_op_1",
+                "Model.layers.1_my_op_0",
+                "Model.layers.1_my_op_2",
+            }
+
+            fwd_decisions: list = []
+            fwd_idx = [0]
+
+            def policy_fn(ctx, op, *args, **kwargs):
+                if ctx.is_recompute:
+                    decision = fwd_decisions[fwd_idx[0]]
+                    fwd_idx[0] += 1
+                    return decision
+                out = ctx.op_output
+                decision = CheckpointPolicy.PREFER_RECOMPUTE
+                if isinstance(out, torch.Tensor):
+                    name = naming.names.get(out)
+                    if name in save_names:
+                        decision = CheckpointPolicy.MUST_SAVE
+                fwd_decisions.append(decision)
+                return decision
+
+            x = torch.randn(4, requires_grad=True)
+            context_fn = functools.partial(
+                create_selective_checkpoint_contexts, policy_fn
+            )
+            with naming:
+                out = checkpoint(
+                    lambda x: mod(x), x,
+                    use_reentrant=False, context_fn=context_fn,
+                )
+                out.sum().backward()
+
+            # 6 forward calls + 3 recomputed (the 3 not in save_names) = 9
+            self.assertEqual(my_count[0], 9)
+
+    @skipIfTorchDynamo("torch dispatch modes don't support compile")
+    def test_auto_naming_mode_per_module_counter(self):
+        # Two blocks each call the same op twice. Use the per-module counter
+        # from AutoNamingMode to save only the second call in block b.
+        with _counter_op("my_op") as (my_op, my_count):
+
+            class Block(torch.nn.Module):
+                def forward(self, x):
+                    return my_op(my_op(x))
+
+            class Model(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.a = Block()
+                    self.b = Block()
+
+                def forward(self, x):
+                    return self.a(x) + self.b(x)
+
+            mod = Model()
+            naming = _AutoNamingMode()
+
+            fwd_decisions: list = []
+            fwd_idx = [0]
+
+            def policy_fn(ctx, op, *args, **kwargs):
+                if ctx.is_recompute:
+                    decision = fwd_decisions[fwd_idx[0]]
+                    fwd_idx[0] += 1
+                    return decision
+                out = ctx.op_output
+                decision = CheckpointPolicy.PREFER_RECOMPUTE
+                if isinstance(out, torch.Tensor):
+                    name = naming.names.get(out)
+                    # Save only the second call (count=1) in block b
+                    if name == "Model.b_my_op_1":
+                        decision = CheckpointPolicy.MUST_SAVE
+                fwd_decisions.append(decision)
+                return decision
+
+            x = torch.randn(4, requires_grad=True)
+            context_fn = functools.partial(
+                create_selective_checkpoint_contexts, policy_fn
+            )
+            with naming:
+                out = checkpoint(
+                    lambda x: mod(x), x,
+                    use_reentrant=False, context_fn=context_fn,
+                )
+                out.sum().backward()
+
+            # 4 forward calls (2 per block) + 3 recomputed (all except b's second)
+            self.assertEqual(my_count[0], 7)
 
 
 class TestAutogradMultipleDispatch(TestCase):

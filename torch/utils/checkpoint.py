@@ -1247,8 +1247,9 @@ class SelectiveCheckpointContext:
         >>>     context_fn=context_fn,
         >>> )
     """
-    def __init__(self, *, is_recompute) -> None:
+    def __init__(self, *, is_recompute, op_output=None) -> None:
         self.is_recompute = is_recompute
+        self.op_output = op_output
 
 
 class CheckpointPolicy(enum.Enum):
@@ -1311,21 +1312,18 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
         self.ac_graph_id = ac_graph_id
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if func in SAC_IGNORED_OPS:
-            return func(*args, **kwargs)
-
         kwargs = {} if kwargs is None else kwargs
-        policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=False),
-                                func, *args, **kwargs)
-        if isinstance(policy, bool):
-            policy = _policy_from_bool(policy)
-
         is_compiling = _is_compiling(func, args, kwargs)
 
+        if func in SAC_IGNORED_OPS:
+            if is_compiling:
+                fx_traceback.current_meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+            return func(*args, **kwargs)
+
         if is_compiling:
-            # Overwrite each node's "recompute" tag to add in the user annotation.
-            fx_traceback.current_meta["recompute"] = policy
-            fx_traceback.current_meta["ac_graph_id"] = self.ac_graph_id
+            from torch.fx.experimental.proxy_tensor import get_proxy_mode
+            proxy_mode = get_proxy_mode()
+            graph_len_before = len(proxy_mode.tracer.graph.nodes) if proxy_mode is not None else None
 
         out = func(*args, **kwargs)
 
@@ -1336,6 +1334,19 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
             any_ret_has_alias_info = False
         else:
             any_ret_has_alias_info = any(ret.alias_info is not None for ret in func._schema.returns)
+
+        policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=False, op_output=out),
+                                func, *args, **kwargs)
+        if isinstance(policy, bool):
+            policy = _policy_from_bool(policy)
+
+        if is_compiling:
+            if proxy_mode is not None:
+                graph = proxy_mode.tracer.graph
+                num_new = len(graph.nodes) - graph_len_before
+                for node, _ in zip(reversed(graph.nodes), range(num_new)):
+                    node.meta["recompute"] = policy
+                    node.meta["ac_graph_id"] = self.ac_graph_id
 
         if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE) or is_compiling:
             self.storage[func].append(tree_map(lambda x: _VersionWrapper(_maybe_detach(x, any_ret_has_alias_info)), out))
