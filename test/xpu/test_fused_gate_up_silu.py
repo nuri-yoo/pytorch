@@ -37,12 +37,13 @@ class TestFusedGateUpSiLU(TestCase):
             f"M={M} K={K} N={N} {dtype} max_diff={(ref - out).abs().max():.6e}",
         )
 
+    @unittest.skipIf(check_if_pvc(), "PVC not available on sycl-tla fp16.")
     def test_fp16_shapes(self, device):
         for M in [1, 4, 32, 64, 128]:
             for K, N in [(512, 1384), (4096, 11008)]:
                 self._test_shape_dtype(device, M, K, N, torch.float16)
 
-    @unittest.skipIf(check_if_pvc(), "PVC not available")
+    @unittest.skipIf(check_if_pvc(), "PVC not available on sycl-tla bf16.")
     def test_bf16_shapes(self, device):
         for M in [1, 4, 32, 64, 128]:
             self._test_shape_dtype(device, M, 512, 1384, torch.bfloat16)
