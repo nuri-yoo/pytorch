@@ -9,6 +9,8 @@ from torch.testing._internal.common_xpu import get_xpu_codename, XPUCodename
 
 
 def check_if_pvc() -> bool:
+    if not torch.xpu.is_available():
+        return False
     xpu_codename = get_xpu_codename()
     if xpu_codename == XPUCodename.PVC:
         return True
