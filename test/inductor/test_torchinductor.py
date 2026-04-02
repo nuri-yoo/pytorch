@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 # ruff: noqa: F841
 import contextlib
+import contextvars
 import copy
 import dataclasses
 import functools
@@ -83,7 +84,11 @@ from torch.testing._internal.common_device_type import (
     expectedFailureXPU,
     largeTensorTest,
 )
-from torch.testing._internal.common_dtype import all_types, get_all_dtypes
+from torch.testing._internal.common_dtype import (
+    all_types,
+    get_all_dtypes,
+    highest_precision_float,
+)
 from torch.testing._internal.common_quantization import (
     _dynamically_quantize_per_channel,
     _group_quantize_tensor_symmetric,
@@ -3336,7 +3341,7 @@ class CommonTemplate:
         def fn(a):
             return torch.round(a)
 
-        dtype = torch.float64 if self.device != "mps" else torch.float32
+        dtype = highest_precision_float(self.device)
         self.common(
             fn,
             [torch.arange(-10, 10, 0.1, dtype=dtype)],
@@ -4650,7 +4655,7 @@ class CommonTemplate:
 
         x1 = torch.randn(30, device=self.device)
         x2 = torch.randn(36, device=self.device)
-        dtype = torch.float64 if self.device != "mps" else torch.float32
+        dtype = highest_precision_float(self.device)
         y = torch.ones(1, dtype=dtype, device=self.device)
 
         self.assertEqual(torch.compile(fn)(x1, y), fn(x1, y))
@@ -5409,8 +5414,9 @@ class CommonTemplate:
         threads = []
         compiled_m = torch.compile(model)
         for _ in range(1, numb_instance + 1):
+            ctx = contextvars.copy_context()
             thread = threading.Thread(
-                target=run_weights_sharing_model, args=(compiled_m, inp)
+                target=ctx.run, args=(run_weights_sharing_model, compiled_m, inp)
             )
             threads.append(thread)
             thread.start()
@@ -6445,7 +6451,7 @@ class CommonTemplate:
             reference_in_float=False,
         )
 
-    @skipCUDAIf(
+    @unittest.skipIf(
         TEST_WITH_ROCM and not torch.cuda.has_magma,
         "ROCm hipsolver backend does not currently support eig",
     )
@@ -6535,7 +6541,7 @@ class CommonTemplate:
         def fn(dist, angle):
             return torch.polar(dist, angle)
 
-        dtype = torch.float64 if self.device != "mps" else torch.float32
+        dtype = highest_precision_float(self.device)
         inp = (
             torch.tensor([1, 2], dtype=dtype),
             torch.tensor([np.pi / 2, 5 * np.pi / 4], dtype=dtype),
@@ -10491,7 +10497,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # Correctness is validated by self.common() above.
         self.assertGreater(torch._inductor.metrics.generated_kernel_count, 0)
 
-    @expectedFailureXPU
     def test_max_pool2d_with_indices_backward5(self):
         # Large window size - decomposition handles via scatter_add
         def fn(a, b, c):
@@ -10777,6 +10782,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps
     def test_dropout2(self):
+        if is_mps_backend(self.device) and torch._inductor.config.align_random_eager:
+            raise AssertionError(
+                "MPS + align_random_eager: will pass but force failure for xfail_if_mps"
+            )
         n = 100000
         weight = torch.ones(
             n, device=self.device, dtype=torch.float32, requires_grad=True
@@ -10814,10 +10823,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         torch.manual_seed(1234)
         weight.grad.zero_()
         r2, (fw_code, bw_code) = run_fw_bw_and_get_code(lambda: run(ones))
-        if is_halide_backend(self.device):
+        if (
+            is_halide_backend(self.device)
+            and not torch._inductor.config.align_random_eager
+        ):
             self.assertEqual(fw_code.count("halide_helpers.rand"), 1)
             self.assertEqual(bw_code.count("halide_helpers.rand"), 0)
-        elif self.device == GPU_TYPE:
+        elif self.device == GPU_TYPE and not torch._inductor.config.align_random_eager:
             self.assertEqual(fw_code.count("tl.rand"), 1)
             self.assertEqual(bw_code.count("tl.rand"), 0)
         g2 = weight.grad.clone()
@@ -10837,6 +10849,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_mps
     @config.patch(search_autotune_cache=False)
     def test_dropout3(self):
+        if is_mps_backend(self.device) and torch._inductor.config.align_random_eager:
+            raise AssertionError(
+                "MPS + align_random_eager + dynamic shapes: will pass but force failure for xfail_if_mps"
+            )
         m = torch.nn.Sequential(
             torch.nn.Linear(32, 32, bias=False),
             torch.nn.Dropout(),
@@ -10854,10 +10870,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             lambda: run(torch.randn([8, 32], device=self.device))
         )
 
-        if is_halide_backend(self.device):
+        if (
+            is_halide_backend(self.device)
+            and not torch._inductor.config.align_random_eager
+        ):
             self.assertEqual(fw_code.count("halide_helpers.rand"), 2)
             self.assertEqual(bw_code.count("halide_helpers.rand"), 0)
-        elif self.device == GPU_TYPE:
+        elif self.device == GPU_TYPE and not torch._inductor.config.align_random_eager:
             # the load_seed_offset arg can be 1 or non-1; depending on whether
             # the triton signature specializes on 1 vs non-1, you might get 1
             # or 2 kernels. In newer versions of triton, there's no specialization
@@ -12707,6 +12726,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     x_strided = x[::2].reshape(25, 2).transpose(0, 1)
                     yield x_strided, y_size, memory_format
 
+    def test_resize_overlapping_strides(self):
+        # Resize on a stride-0 view should read logical elements, not raw storage.
+        def fn(x):
+            view = torch.as_strided(x, (100,), (0,))
+            return torch.ops.aten.resize(view, (50,))
+
+        self.common(fn, (torch.ones(10),))
+
     def test_resize(self):
         def fn(x, size, memory_format):
             # NOTE: Tensor.resize() =/= aten::resize()
@@ -13329,6 +13356,29 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         with self.assertRaisesRegex(AssertionError, "torch.ops.dummy.op_name"):
             assert_alignment(tensor, 0, "torch.ops.dummy.op_name")
 
+    @requires_gpu()
+    @skip_if_not_triton
+    @unittest.skipIf(
+        config.cpp_wrapper,
+        "Inductor does not generate size/stride asserts for cpp_wrapper",
+    )
+    def test_input_asserts_deferred_to_first_use(self):
+        def fn(x, y, z):
+            a = torch.mm(x, y)
+            b = torch.mm(a, z)
+            return b
+
+        x = torch.randn(16, 32, device=self.device)
+        y = torch.randn(32, 64, device=self.device)
+        z = torch.randn(64, 8, device=self.device)
+
+        _, code = run_and_get_code(torch.compile(fn), x, y, z)
+        # z's assert should appear after the first mm, not at the top
+        # with all the other asserts
+        FileCheck().check("def call").check_count(
+            "assert_size_stride", 2, exactly=True
+        ).check("extern_kernels.mm(").run(code[0])
+
     @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
     @torch._inductor.config.patch(implicit_fallbacks=True)
     def test_custom_op_unbacked_symints(self):
@@ -13685,7 +13735,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             return out
 
         device = "cpu"
-        dtype = torch.double if self.device != "mps" else torch.float32
+        dtype = highest_precision_float(self.device)
         tensor = torch.rand((1,), dtype=dtype, device=device)
         index = torch.tensor([0], dtype=torch.long, device=device)
         source = torch.rand((1,), dtype=dtype, device=device)
@@ -16237,7 +16287,10 @@ if RUN_GPU:
             if config.triton.multi_kernel:
                 self.assertEqual(len(kernels), 4)
                 expected_divisible[2] = expected_divisible.pop(1)
-            elif config.triton.cooperative_reductions:
+            elif (
+                config.triton.cooperative_reductions
+                or config.triton.force_cooperative_reductions
+            ):
                 self.assertEqual(len(kernels), 1)
                 expected_divisible = {
                     # one kernel, with extra workspace/semaphore args
@@ -17326,8 +17379,15 @@ if RUN_GPU:
 
         @torch._functorch.config.patch("donated_buffer", True)
         # The inplace updating does not happen after we fused the
-        # layernorm backward
-        @torch._inductor.config.patch("triton.mix_order_reduction", False)
+        # layernorm backward, or if we do cooperative reductions (due to the change in
+        # optimal peak memory ordering).
+        @torch._inductor.config.patch(
+            {
+                "triton.cooperative_reductions": False,
+                "triton.force_cooperative_reductions": False,
+                "triton.mix_order_reduction": False,
+            }
+        )
         def test_donated_buffer_inplace(self):
             batch_size = 32
             seq_length = 50
@@ -17692,6 +17752,46 @@ if RUN_GPU:
             result, code = run_and_get_code(torch.compile(fn), inp)
             self.assertIn("0x80000000", code[0])
             torch.testing.assert_close(result, fn(inp))
+
+        def test_3d_reductions_with_max_tiles_3(self):
+            # Inductor only supports at most two reduction iteration ranges, R0 and R1, which the
+            # reduction component of the kernel can be tiled across.
+            # When max_tiles>=3, SIMDScheduling.create_tiling would previously incorrectly allow the
+            # tiling of the kernel in three dimensions, despite there being no pointwise component
+            # of the kernel.
+
+            @torch._inductor.config.patch(
+                {
+                    "triton.prefer_nd_tiling": True,
+                    "triton.max_tiles": 3,
+                    "triton.tile_reductions": True,
+                    "triton.use_tensor_descriptor": True,
+                }
+            )
+            @torch.compile
+            def sum(x):
+                return torch.sum(x, [0, 1, 2])
+
+            shape = (2, 2, 4)
+            strides = (32, 8, 1)
+
+            arg0_1_orig = torch.arange(
+                math.prod(shape), device=GPU_TYPE, dtype=torch.int32
+            ).view(shape)
+            arg0_1 = torch.empty_strided(
+                shape, strides, device=GPU_TYPE, dtype=torch.int32
+            )
+            arg0_1.copy_(arg0_1_orig)
+
+            actual, code = run_and_get_code(sum, arg0_1)
+            expected = torch.sum(arg0_1, [0, 1, 2])
+
+            torch.testing.assert_close(actual=actual, expected=expected)
+
+            fc = FileCheck()
+            # There's no pointwise work to do, so xnumel should be 1...
+            fc.check("xnumel = 1")
+            fc.run(code[0])
 
     class RNNTest(TestCase):
         device_type = GPU_TYPE
