@@ -1075,7 +1075,7 @@ class aten_distributed_optimizations:
     """Configuration for distributed optimization passes on ATen FX graphs."""
 
     # Enable overlap scheduling pass
-    enable_overlap_scheduling: bool = False
+    enable_overlap_scheduling: bool = not is_fbcode()
 
     # Enable overlap-preserving collective bucketing
     collective_bucketing: bool | None = None
