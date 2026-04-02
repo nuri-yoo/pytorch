@@ -4722,7 +4722,7 @@ class TestLinalg(TestCase):
         make_arg = partial(make_tensor, dtype=dtype, device=device)
         make_fullrank = partial(make_fullrank_matrices_with_distinct_singular_values, dtype=dtype, device=device)
         b, n, k = shape
-        for left, uni, expand_a, tr_a, conj_a, expand_b, tr_b, conj_b in product((True, False), repeat=8):
+        for left, uni, expand_a, tr_a, conj_a, neg_a, expand_b, tr_b, conj_b, neg_b in product((True, False), repeat=10):
             # expand means that we generate a batch of matrices with a stride of zero in the batch dimension
             if (conj_a or conj_b) and not dtype.is_complex:
                 continue
@@ -4767,6 +4767,10 @@ class TestLinalg(TestCase):
                 A = A.conj()
             if conj_b:
                 B = B.conj()
+            if neg_a:
+                A = A._neg_view()
+            if neg_b:
+                B = B._neg_view()
             if expand_a:
                 A = A.expand(b, *size_a)
             if expand_b:
