@@ -272,6 +272,9 @@ class TestCKBackend(TestCase):
 
         tensor_options = {"device": "cuda", "dtype": torch.bfloat16}
         x = torch.ones(x_shape, **tensor_options)
+        # Reshape 1D bias to 2D with broadcast stride (stride[0]=0) for ATen template assertion
+        if x.dim() == 1:
+            x = x.unsqueeze(0).as_strided((1, x.size(0)), (0, 1))
         a = torch.randn(m, k, **tensor_options)
         b = torch.randn(k, n, **tensor_options)
 
