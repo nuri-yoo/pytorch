@@ -5590,19 +5590,27 @@ class Scheduler:
         common_buffer_names = (
             node1.read_writes.buffer_names() & node2.read_writes.buffer_names()
         )
-        node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
-        node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
+        node1_reads = {dep.name: dep for dep in node1.read_writes.reads}
+        node1_writes = {dep.name: dep for dep in node1.read_writes.writes}
+        node2_reads = {dep.name: dep for dep in node2.read_writes.reads}
+        node2_writes = {dep.name: dep for dep in node2.read_writes.writes}
 
         candidates = []
         for buffer_name in common_buffer_names:
-            lhs_dep = node1_name2dep[buffer_name]
-            rhs_dep = node2_name2dep[buffer_name]
+            lhs_dep = node1_writes.get(buffer_name) or node1_reads[buffer_name]
+            rhs_dep = node2_writes.get(buffer_name) or node2_reads[buffer_name]
+
+            is_write_read = (
+                buffer_name in node1_writes and buffer_name in node2_reads
+            ) or (buffer_name in node2_writes and buffer_name in node1_reads)
+
             if (
                 lhs_dep.normalize_with_stride_order()
                 == rhs_dep.normalize_with_stride_order()
             ):
                 candidates.append(
                     (
+                        is_write_read,
                         V.graph.sizevars.optimization_hint(
                             lhs_dep.get_numel(), fallback=0
                         ),
@@ -5610,12 +5618,33 @@ class Scheduler:
                         rhs_dep,
                     )
                 )
+            elif is_write_read:
+                # A write→read dep failed normalize_with_stride_order.
+                # This could be a dimension order issue (reordering can
+                # fix it) or a factorization issue (only reindexing can).
+                # Distinguish by checking if the write dep's sizes are
+                # a subset of the read dep's — if so, reordering the
+                # read's loops could align them.
+                w = node1_writes.get(buffer_name) or node2_writes.get(buffer_name)
+                r = node2_reads.get(buffer_name) or node1_reads.get(buffer_name)
+                if isinstance(w, MemoryDep) and isinstance(r, MemoryDep):
+                    sv = V.graph.sizevars
+                    w_sizes = w.normalize().size
+                    r_sizes = r.normalize().size
+                    if not all(
+                        any(sv.statically_known_equals(ws, rs) for rs in r_sizes)
+                        for ws in w_sizes
+                    ):
+                        return -1
 
         if len(candidates) == 0:
             return -1
 
-        # Pick the largest buffer to guide the loop reordering
-        _numel, lhs_dep, rhs_dep = max(candidates, key=operator.itemgetter(0))
+        # Prefer write→read deps over shared reads. Among same
+        # priority, pick the largest buffer.
+        _is_wr, _numel, lhs_dep, rhs_dep = max(
+            candidates, key=operator.itemgetter(0, 1)
+        )
 
         if not isinstance(lhs_dep, MemoryDep) or not isinstance(rhs_dep, MemoryDep):
             return -1
