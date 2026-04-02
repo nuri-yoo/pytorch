@@ -1,5 +1,5 @@
 """
-Collective runtime estimation using CUDA events and power-of-2 rounding.
+Node runtime estimation: CUDA events benchmarking and profile-guided estimation.
 """
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ import functools
 import itertools
 import operator
 from functools import lru_cache
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.fx as fx
@@ -16,6 +16,12 @@ from torch._inductor.fx_passes.bucketing import _schedulable_wait_node
 from torch._inductor.utils import clear_on_fresh_cache
 from torch._logging import getArtifactLogger, trace_structured
 from torch.fx.operator_schemas import normalize_function
+
+
+if TYPE_CHECKING:
+    from torch._inductor.fx_passes.profile_guided_estimation import (
+        ProfileGuidedEstimator,
+    )
 
 
 def _format_csv(headers: list[str], rows: list[list[str]]) -> str:
@@ -426,3 +432,49 @@ def _log_collective_benchmarks(
         },
         payload_fn=lambda: log_str,
     )
+
+
+def _collect_analytical_estimates(
+    gm: fx.GraphModule,
+    pge_estimator: ProfileGuidedEstimator,
+) -> dict[str, float]:
+    """Collect analytical runtime estimates for nodes that PGE matched.
+
+    Runs the analytical estimator (no custom override) over the same nodes
+    to enable PGE vs analytical comparison logging.
+    """
+    from torch._inductor.fx_passes.overlap_scheduling import (
+        estimate_roofline_runtime_ms,
+        is_compute_node,
+    )
+    from torch._inductor.fx_passes.profile_guided_estimation import _is_collective_node
+    from torch.utils._ordered_set import OrderedSet
+
+    estimation_log = pge_estimator.estimation_log
+    matched_names = OrderedSet([e["node"] for e in estimation_log])
+    if not matched_names:
+        return {}
+
+    analytical: dict[str, float] = {}
+    for node in gm.graph.nodes:
+        if node.name not in matched_names:
+            continue
+        # Collective: use analytical NCCL estimator
+        if _schedulable_wait_node(node):
+            start = node.args[0]
+            if isinstance(start, fx.Node) and start.name in matched_names:
+                est = torch._inductor.comm_analysis.estimate_nccl_collective_runtime_from_fx_node(
+                    start
+                )
+                analytical[start.name] = est
+        elif _is_collective_node(node):
+            est = torch._inductor.comm_analysis.estimate_nccl_collective_runtime_from_fx_node(
+                node
+            )
+            analytical[node.name] = est
+        # Compute: use roofline estimation
+        elif is_compute_node(node) and node.name in matched_names:
+            est = estimate_roofline_runtime_ms(node)
+            if est is not None:
+                analytical[node.name] = est
+    return analytical

@@ -1,4 +1,7 @@
 # Owner(s): ["module: inductor"]
+import json
+import os
+import tempfile
 import unittest
 
 import torch
@@ -11,6 +14,13 @@ import torch.fx as fx
 # for some reason importing functional collectives after dynamo breaks collectives handling!
 from torch._C import FileCheck
 from torch._dynamo.utils import counters
+from torch._inductor.fx_passes.profile_guided_estimation import (
+    _normalize_profile_dtype,
+    _normalize_profile_indices,
+    _rank_stride,
+    ProfileData,
+    ProfileGuidedEstimator,
+)
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -19,6 +29,7 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
+    TestCase,
 )
 from torch.testing._internal.inductor_utils import HAS_GPU
 from torch.utils._ordered_set import OrderedSet
@@ -1539,6 +1550,550 @@ class TestForeachGroupsUnit(InductorTestCase):
             ag_ins, 2, "default", torch.float32, out_dtype_ints, 0, None
         )
         self.assertTrue(torch.allclose(result_with, result_without))
+
+
+def _make_pge_trace(
+    collectives=None,
+    matmuls=None,
+    sdpa_ops=None,
+    pg_config=None,
+):
+    """Build a minimal Chrome Trace JSON dict for PGE testing."""
+    events = []
+    eid = 1000
+
+    for coll in collectives or []:
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": coll["dur"],
+                "name": "nccl_kernel",
+                "args": {
+                    "Collective name": coll["name"],
+                    "Process Group Name": coll.get("pg_name", "0"),
+                    "Process Group Ranks": coll.get("ranks", "[0, 1]"),
+                    "Group size": coll.get("group_size", 2),
+                    "In msg nelems": coll.get("nelems", 1024),
+                    "Out msg nelems": coll.get("out_nelems", coll.get("nelems", 1024)),
+                    "dtype": coll.get("dtype", "Float"),
+                },
+            }
+        )
+
+    for mm in matmuls or []:
+        eid += 1
+        events.append(
+            {
+                "cat": "cpu_op",
+                "name": "aten::mm",
+                "dur": 0,
+                "args": {
+                    "External id": eid,
+                    "Input Dims": mm["shapes"],
+                    "Input type": mm.get("dtypes", ["Float", "Float"]),
+                },
+            }
+        )
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": mm["dur"],
+                "name": "sm80_xmma_gemm",
+                "args": {"External id": eid},
+            }
+        )
+
+    for sdpa in sdpa_ops or []:
+        eid += 1
+        op_name = sdpa.get("op_name", "aten::_scaled_dot_product_flash_attention")
+        events.append(
+            {
+                "cat": "cpu_op",
+                "name": op_name,
+                "dur": 0,
+                "args": {
+                    "External id": eid,
+                    "Input Dims": sdpa["input_dims"],
+                    "Input type": sdpa.get("dtypes", ["BFloat16"]),
+                },
+            }
+        )
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": sdpa["dur"],
+                "name": "flash_fwd_kernel",
+                "args": {"External id": eid},
+            }
+        )
+
+    dist_info = {}
+    if pg_config is not None:
+        dist_info["pg_config"] = pg_config
+    else:
+        dist_info["pg_config"] = {"0": {"ranks": [0, 1]}}
+
+    return {"traceEvents": events, "distributedInfo": dist_info}
+
+
+def _load_pge_profile(data):
+    """Write trace dict to a temp file and load via ProfileData."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        f.flush()
+        path = f.name
+    try:
+        profile = ProfileData()
+        profile.load(path)
+        return profile
+    finally:
+        os.unlink(path)
+
+
+class TestProfileGuidedEstimation(TestCase):
+    # Pure data-path tests (JSON parsing + index lookup) — no Inductor cache needed.
+    def test_collective_lookup_and_interpolation(self):
+        """Parse collectives, exact lookup, interpolation, stride fallback, name normalization, edge cases."""
+        # _rank_stride
+        self.assertEqual(_rank_stride((0, 2, 4, 6)), 2)
+        self.assertEqual(_rank_stride((0, 1, 2, 3)), 1)
+        self.assertIsNone(_rank_stride((0, 1, 4, 5)))
+        self.assertIsNone(_rank_stride((0,)))
+        self.assertIsNone(_rank_stride(()))
+
+        # Collective name normalization
+        norm = ProfileData._normalize_collective_name
+        self.assertEqual(norm("_allgather_base"), "all_gather")
+        self.assertEqual(norm("allreduce"), "all_reduce")
+        self.assertEqual(norm("reduce_scatter_tensor_coalesced"), "reduce_scatter")
+        self.assertEqual(norm("all_to_all_single"), "all_to_all")
+        self.assertEqual(norm("barrier"), "barrier")
+
+        # Load trace with two data points for interpolation + stride fallback
+        trace = _make_pge_trace(
+            collectives=[
+                {
+                    "name": "allreduce",
+                    "dur": 100.0,
+                    "nelems": 1000,
+                    "dtype": "Float",
+                    "ranks": "[0, 2, 4, 6]",
+                    "group_size": 4,
+                },
+                {
+                    "name": "allreduce",
+                    "dur": 800.0,
+                    "nelems": 8000,
+                    "dtype": "Float",
+                    "ranks": "[0, 2, 4, 6]",
+                    "group_size": 4,
+                },
+            ],
+            pg_config={"0": {"ranks": [0, 2, 4, 6]}},
+        )
+        profile = _load_pge_profile(trace)
+        _normalize_profile_indices(profile)
+
+        self.assertEqual(len(profile.collectives), 2)
+
+        # Exact match: 100 us -> 0.1 ms
+        result = profile.lookup_collective("all_reduce", (0, 2, 4, 6), 1000, "Float")
+        self.assertIsNotNone(result)
+        est, source = result
+        self.assertAlmostEqual(est, 0.1, places=4)
+        self.assertEqual(source, "profile")
+
+        # Interpolation between 1000 and 8000 nelems
+        result = profile.lookup_collective("all_reduce", (0, 2, 4, 6), 4000, "Float")
+        self.assertIsNotNone(result)
+        est, source = result
+        self.assertGreater(est, 0.1)
+        self.assertLess(est, 0.8)
+        self.assertEqual(source, "profile")
+
+        # Stride fallback: different ranks, same stride=2 size=4
+        result = profile.lookup_collective("all_reduce", (1, 3, 5, 7), 1000, "Float")
+        self.assertIsNotNone(result)
+        est, _ = result
+        self.assertAlmostEqual(est, 0.1, places=4)
+
+        # Miss: wrong collective name
+        self.assertIsNone(
+            profile.lookup_collective("all_to_all", (0, 2, 4, 6), 1000, "Float")
+        )
+
+        # Zero-duration events skipped
+        trace_zero = _make_pge_trace(
+            collectives=[
+                {"name": "allreduce", "dur": 0.0, "nelems": 1024, "dtype": "Float"}
+            ]
+        )
+        self.assertEqual(len(_load_pge_profile(trace_zero).collectives), 0)
+
+        # Empty trace
+        empty = _load_pge_profile({"traceEvents": []})
+        self.assertEqual(len(empty.collectives), 0)
+        self.assertEqual(len(empty.matmuls), 0)
+
+    def test_matmul_and_sdpa_lookup(self):
+        """Matmul and SDPA: exact match, FLOP-ratio interpolation, backward, dtype miss."""
+        trace = _make_pge_trace(
+            matmuls=[
+                {
+                    "shapes": [[128, 256], [256, 512]],
+                    "dur": 50.0,
+                    "dtypes": ["Float", "Float"],
+                },
+                {
+                    "shapes": [[64, 128], [128, 64]],
+                    "dur": 10.0,
+                    "dtypes": ["Float", "Float"],
+                },
+            ],
+            sdpa_ops=[
+                {
+                    "input_dims": [[2, 8, 1024, 64]],
+                    "dur": 300.0,
+                    "dtypes": ["BFloat16"],
+                },
+                {
+                    "input_dims": [[2, 8, 512, 64]],
+                    "dur": 100.0,
+                    "dtypes": ["BFloat16"],
+                },
+                {
+                    "input_dims": [[2, 8, 1024, 64]],
+                    "dur": 500.0,
+                    "dtypes": ["BFloat16"],
+                    "op_name": "aten::_scaled_dot_product_flash_attention_backward",
+                },
+            ],
+        )
+        profile = _load_pge_profile(trace)
+        _normalize_profile_indices(profile)
+
+        # Matmul exact match: 50 us -> 0.05 ms
+        self.assertAlmostEqual(
+            profile.lookup_mm(((128, 256), (256, 512)), "Float"), 0.05, places=4
+        )
+
+        # Matmul FLOP-ratio interpolation
+        result = profile.lookup_mm(((128, 128), (128, 128)), "Float")
+        self.assertIsNotNone(result)
+        ref_flops = 2 * 64 * 64 * 128
+        target_flops = 2 * 128 * 128 * 128
+        self.assertAlmostEqual(
+            result, 10.0 * (target_flops / ref_flops) / 1e3, places=4
+        )
+
+        # Matmul dtype miss
+        self.assertIsNone(profile.lookup_mm(((128, 256), (256, 512)), "Half"))
+
+        # SDPA exact match: 300 us -> 0.3 ms
+        self.assertAlmostEqual(
+            profile.lookup_sdpa(2, 8, 1024, 64, "BFloat16", is_backward=False),
+            0.3,
+            places=4,
+        )
+
+        # SDPA interpolation from 512 data point to a new shape
+        result = profile.lookup_sdpa(2, 8, 2048, 64, "BFloat16", is_backward=False)
+        self.assertIsNotNone(result)
+        self.assertGreater(result, 0.3)
+
+        # SDPA backward
+        self.assertAlmostEqual(
+            profile.lookup_sdpa(2, 8, 1024, 64, "BFloat16", is_backward=True),
+            0.5,
+            places=4,
+        )
+
+    def test_dtype_normalization_and_collision(self):
+        """Dtype normalization, c10:: prefix handling, and collision averaging for matmul/SDPA."""
+        self.assertEqual(_normalize_profile_dtype("c10::Float"), "Float")
+        self.assertEqual(_normalize_profile_dtype("c10::BFloat16"), "BFloat16")
+        self.assertEqual(_normalize_profile_dtype("Float"), "Float")
+        self.assertEqual(_normalize_profile_dtype("CustomType"), "CustomType")
+
+        # Matmul dtype collision: two raw dtypes normalize to same key -> averaged
+        profile = ProfileData()
+        profile._matmul_index = {
+            ((128, 256), (256, 512), "c10::BFloat16"): 100.0,
+            ((128, 256), (256, 512), "BFloat16"): 200.0,
+        }
+        _normalize_profile_indices(profile)
+        key = ((128, 256), (256, 512), "BFloat16")
+        self.assertIn(key, profile._matmul_index)
+        self.assertAlmostEqual(profile._matmul_index[key], 150.0)
+
+        # SDPA dtype collision
+        profile2 = ProfileData()
+        profile2._sdpa_index = {
+            (2, 8, 1024, 64, "c10::BFloat16", False): 100.0,
+            (2, 8, 1024, 64, "BFloat16", False): 300.0,
+        }
+        _normalize_profile_indices(profile2)
+        key2 = (2, 8, 1024, 64, "BFloat16", False)
+        self.assertIn(key2, profile2._sdpa_index)
+        self.assertAlmostEqual(profile2._sdpa_index[key2], 200.0)
+
+        # PG config parsing: dict format
+        trace = _make_pge_trace(
+            pg_config={"0": {"ranks": [0, 1, 2, 3]}, "1": {"ranks": [0, 2]}},
+        )
+        profile3 = _load_pge_profile(trace)
+        self.assertEqual(profile3.pg_configs["0"], (0, 1, 2, 3))
+        self.assertEqual(profile3.pg_configs["1"], (0, 2))
+
+        # PG config parsing: list format
+        trace_list = {
+            "traceEvents": [],
+            "distributedInfo": {
+                "pg_config": [{"pg_name": "default", "ranks": [0, 1, 2, 3]}]
+            },
+        }
+        profile4 = _load_pge_profile(trace_list)
+        self.assertEqual(profile4.pg_configs["default"], (0, 1, 2, 3))
+
+    def test_bandwidth_extrapolation(self):
+        """When target nelems > EXTRAPOLATION_CAP * max_observed, use BW-based estimation."""
+        trace = _make_pge_trace(
+            collectives=[
+                {
+                    "name": "allreduce",
+                    "dur": 100.0,
+                    "nelems": 1000,
+                    "dtype": "Float",
+                    "ranks": "[0, 1, 2, 3]",
+                    "group_size": 4,
+                },
+                {
+                    "name": "allreduce",
+                    "dur": 400.0,
+                    "nelems": 4000,
+                    "dtype": "Float",
+                    "ranks": "[0, 1, 2, 3]",
+                    "group_size": 4,
+                },
+            ],
+            pg_config={"0": {"ranks": [0, 1, 2, 3]}},
+        )
+        profile = _load_pge_profile(trace)
+        _normalize_profile_indices(profile)
+
+        # Within range: should use log-log interpolation
+        result_in = profile.lookup_collective("all_reduce", (0, 1, 2, 3), 2000, "Float")
+        self.assertIsNotNone(result_in)
+        est_in, source_in = result_in
+        self.assertEqual(source_in, "profile")
+
+        # Far beyond range (> 2x max_observed=4000): should use BW-based estimation
+        result_far = profile.lookup_collective(
+            "all_reduce", (0, 1, 2, 3), 100000, "Float"
+        )
+        self.assertIsNotNone(result_far)
+        est_far, source_far = result_far
+        self.assertEqual(source_far, "pg_bandwidth")
+        self.assertGreater(est_far, 0)
+
+    def test_bmm_and_addmm_parsing(self):
+        """bmm and addmm are parsed from profiles and looked up correctly."""
+        # Build trace with bmm and addmm events
+        events = []
+        eid = 2000
+
+        # bmm: [4, 32, 64] @ [4, 64, 128]
+        eid += 1
+        events.append(
+            {
+                "cat": "cpu_op",
+                "name": "aten::bmm",
+                "dur": 0,
+                "args": {
+                    "External id": eid,
+                    "Input Dims": [[4, 32, 64], [4, 64, 128]],
+                    "Input type": ["Float", "Float"],
+                },
+            }
+        )
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": 80.0,
+                "name": "sm80_xmma_gemm",
+                "args": {"External id": eid},
+            }
+        )
+
+        # addmm: bias=[512], mat1=[128, 256], mat2=[256, 512]
+        eid += 1
+        events.append(
+            {
+                "cat": "cpu_op",
+                "name": "aten::addmm",
+                "dur": 0,
+                "args": {
+                    "External id": eid,
+                    "Input Dims": [[512], [128, 256], [256, 512]],
+                    "Input type": ["Float", "Float", "Float"],
+                },
+            }
+        )
+        events.append(
+            {
+                "cat": "kernel",
+                "dur": 60.0,
+                "name": "sm80_xmma_gemm",
+                "args": {"External id": eid},
+            }
+        )
+
+        data = {"traceEvents": events, "distributedInfo": {"pg_config": {}}}
+        profile = _load_pge_profile(data)
+        _normalize_profile_indices(profile)
+
+        self.assertEqual(len(profile.matmuls), 2)
+
+        # bmm exact match: 80 us -> 0.08 ms
+        self.assertAlmostEqual(
+            profile.lookup_mm(((4, 32, 64), (4, 64, 128)), "Float"),
+            0.08,
+            places=4,
+        )
+
+        # addmm stored as 2D shapes of mat1, mat2: 60 us -> 0.06 ms
+        self.assertAlmostEqual(
+            profile.lookup_mm(((128, 256), (256, 512)), "Float"),
+            0.06,
+            places=4,
+        )
+
+    def test_malformed_and_missing_fields(self):
+        """Invalid JSON raises; missing traceEvents yields empty profile."""
+        # Invalid JSON
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write("{not valid json")
+            path = f.name
+        try:
+            with self.assertRaises(json.JSONDecodeError):
+                profile = ProfileData()
+                profile.load(path)
+        finally:
+            os.unlink(path)
+
+        # Valid JSON but missing traceEvents key
+        profile = _load_pge_profile({"distributedInfo": {"pg_config": {}}})
+        self.assertEqual(len(profile.collectives), 0)
+        self.assertEqual(len(profile.matmuls), 0)
+
+        # Events with missing fields are silently skipped
+        trace = _make_pge_trace(
+            collectives=[
+                {
+                    "name": "allreduce",
+                    "dur": 100.0,
+                    "nelems": 1024,
+                    "dtype": "Float",
+                },
+            ]
+        )
+        # Remove optional fields from the event
+        for ev in trace["traceEvents"]:
+            ev["args"].pop("Group size", None)
+        profile2 = _load_pge_profile(trace)
+        # Should still parse (group_size defaults to 0)
+        self.assertEqual(len(profile2.collectives), 1)
+
+
+@requires_accelerator_dist_backend(["nccl", "xccl"])
+@unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
+class TestProfileGuidedEstimatorIntegration(InductorTestCase):
+    """Integration tests: ProfileGuidedEstimator.__call__ on traced FX graphs."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+
+        store = FakeStore()
+        dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
+        cls.device = "cuda"
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        dist.destroy_process_group()
+
+    def test_estimator_call_on_fx_graph(self):
+        """ProfileGuidedEstimator returns estimates for collective and mm nodes in a traced graph."""
+        group_name = dist.distributed_c10d._get_default_group().group_name
+        pg_ranks = tuple(sorted(dist.get_process_group_ranks(dist.group.WORLD)))
+
+        # Build a trace with matching collective and matmul data
+        trace = _make_pge_trace(
+            collectives=[
+                {
+                    "name": "allreduce",
+                    "dur": 200.0,
+                    "nelems": 256,
+                    "out_nelems": 256,
+                    "dtype": "Float",
+                    "ranks": json.dumps(list(pg_ranks)),
+                    "group_size": len(pg_ranks),
+                },
+            ],
+            matmuls=[
+                {
+                    "shapes": [[16, 16], [16, 16]],
+                    "dur": 50.0,
+                    "dtypes": ["Float", "Float"],
+                },
+            ],
+            pg_config={"0": {"ranks": list(pg_ranks)}},
+        )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(trace, f)
+            f.flush()
+            trace_path = f.name
+
+        try:
+            estimator = ProfileGuidedEstimator(trace_path)
+
+            def func(a, b):
+                ar = torch.ops._c10d_functional.all_reduce(
+                    a, "sum", len(pg_ranks), group_name
+                )
+                ar_out = torch.ops._c10d_functional.wait_tensor(ar)
+                mm = torch.mm(b, b)
+                return ar_out + mm
+
+            with FakeTensorMode():
+                a = torch.randn(16, 16, device=self.device)
+                b = torch.randn(16, 16, device=self.device)
+                gm = make_fx(func)(a, b)
+
+            # Call estimator on each node
+            collective_hit = False
+            mm_hit = False
+            for node in gm.graph.nodes:
+                est = estimator(node)
+                if "all_reduce" in str(node.target) and "wait" not in str(node.target):
+                    if est is not None:
+                        collective_hit = True
+                        self.assertGreater(est, 0)
+                if node.target == torch.ops.aten.mm.default:
+                    if est is not None:
+                        mm_hit = True
+                        self.assertAlmostEqual(est, 0.05, places=4)
+
+            self.assertTrue(
+                collective_hit, "Estimator should match the collective node"
+            )
+            self.assertTrue(mm_hit, "Estimator should match the mm node")
+            self.assertGreater(len(estimator.estimation_log), 0)
+        finally:
+            os.unlink(trace_path)
 
 
 if __name__ == "__main__":
