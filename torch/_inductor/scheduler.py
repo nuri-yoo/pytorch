@@ -1604,7 +1604,7 @@ class SchedulerNode(BaseSchedulerNode):
         recompute_sizes_body_func: Callable[..., Any] | None = None,
     ) -> None:
         fake_deps: OrderedSet[Dep] = OrderedSet(
-            dep for dep in self.read_writes.reads if isinstance(dep, (WeakDep, StarDep))
+            dep for dep in self.read_writes.reads if isinstance(dep, (WeakDep, StarDep, UserTritonDep))
         )
         self._compute_attrs(
             extra_indexing_constraints=extra_indexing_constraints,
@@ -6267,13 +6267,9 @@ class Scheduler:
             def _match(dep1: Dep, dep2: Dep):
                 if dep1 == dep2:
                     return True
-                if isinstance(dep1, (StarDep, MemoryDep)) and isinstance(
-                    dep2, (StarDep, MemoryDep)
+                if isinstance(dep1, (StarDep, MemoryDep, UserTritonDep)) and isinstance(
+                    dep2, (StarDep, MemoryDep, UserTritonDep)
                 ):
-                    return dep1.name == dep2.name
-                if (
-                    isinstance(dep1, UserTritonDep) and isinstance(dep2, MemoryDep)
-                ) or (isinstance(dep2, UserTritonDep) and isinstance(dep1, MemoryDep)):
                     return dep1.name == dep2.name
                 return False
 

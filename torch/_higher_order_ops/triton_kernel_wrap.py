@@ -1233,7 +1233,7 @@ def identify_accessed_tensors(
     3) Analyzes the graph to detect which input tensors are read and/or written
     """
 
-    from torch._inductor.dependencies import Dep, ReadWrites, StarDep
+    from torch._inductor.dependencies import Dep, ReadWrites, UserTritonDep 
     from torch._inductor.ir import TensorBox
 
     ttir_module = None
@@ -1242,7 +1242,7 @@ def identify_accessed_tensors(
         ttir_module, ordered_arg_names = generate_ttir(
             kernel, kwargs, tma_descriptor_metadata
         )
-        print(ttir_module)
+        # print(ttir_module)
 
         # extract functions from TTIR using MLIR bindings exposed by Triton code
         functions = ttir_to_functions(ttir_module)
@@ -1308,7 +1308,7 @@ def identify_accessed_tensors(
             if isinstance(value, (Tensor, TensorBox))
         ]
         # TODO: Use UserTritonDep
-        all_deps = OrderedSet(StarDep(name) for name in all_tensor_names)
+        all_deps = OrderedSet(UserTritonDep(name=name, index=None) for name in all_tensor_names)
         all_deps = typing.cast(OrderedSet[Dep], all_deps)
         return TensorAccesses(
             ReadWrites(
@@ -2545,7 +2545,7 @@ class TraceableTritonKernelWrapper:
         return arg
 
 
-# TODO: - Caching.
+# TODO: - Class level caching.
 #       - Move get_tma_stores here.
 #       - Document:
 #           - op_int_attrs will raise in symbolic
@@ -2700,8 +2700,8 @@ class KernelAccessAnalyzer:
                     # )
                     self.extract_symbolic = False
                     conservative.traverse(sink, ops, accesses, skip_loads)
-                    print(f"Exception {e=}")
-                    print(accesses)
+                    # print(f"Exception {e=}")
+                    # print(accesses)
             else:
                 conservative.traverse(sink, ops, accesses, skip_loads)
 
@@ -2748,8 +2748,8 @@ class KernelAccessAnalyzer:
         )
 
     def _decide_can_fuse_epilogue(self) -> bool:
-        print(f"{self.write_accesses=}")
-        print(f"{self.read_accesses=}")
+        # print(f"{self.write_accesses=}")
+        # print(f"{self.read_accesses=}")
         # only do epilogue fusion if the kernel has a single output tensor
         if len(self.write_accesses) != 1:
             return False
@@ -2828,6 +2828,39 @@ class SymbolicFailure(Exception):
 
 
 class SymbolicAnalyzer:
+    """
+    Traces pointer arithmetic to produce symbolic index expressions for each
+    tensor access.
+
+    For each access sink, this class walks the def-use chain upwards building
+    a SymPy expression that represents the memory index as a function of the 
+    kernel's configuration. The expected form of a fully resolved expression is:
+        p{idx} + <index_expr>
+    where p{idx} is a placeholder symbol for the base pointer of tensor
+    argument idx, and <index_expr> is extracted and stored in the UserTritonDep.
+
+    Symbols are only minted only for the following leaves:
+      - Program IDs (tt.get_program_id): bounded by the corresponding grid dimension
+      - Range variables (tt.make_range): bounded by end - start
+      - Induction variables (InductionVar): derived from loop bounds and step
+      - Iteration arguments (IterArg): modeled as init + iv * step
+
+    Bounds are read and stored in the appropirate dataclass (Op, InductionVar, ...) from
+    MLIR integer attributes during TTIR parsing. If a required attr is absent, 
+    `Op.get_int_attr` raises, and this traversal will fall back to ConservativeAnalyzer.
+
+    Shape-context ops (tt.expand_dims, tt.broadcast, tt.splat, ...) do not mint
+    symbols but update `current_shape` before recursing, so the same SSA
+    node can produce different expressions depending on how its output is
+    broadcast. The recursion cache therefore keys on (ssa_idx, current_shape)
+    rather than ssa_idx alone.
+
+    Redundant div/mod operations are simplified via `_get_bound`: if an
+    upper bound B for an expression is known and B <= k, then
+      expr % k  →  expr      (mod is identity)
+      expr // k →  0         (quotient is zero)
+    """
+
     def __init__(self, analyzer: KernelAccessAnalyzer):
         self.kwargs = analyzer.kwargs
         self.arg_names = analyzer.tensor_names
@@ -2910,7 +2943,7 @@ class SymbolicAnalyzer:
         )
 
     def _build_expr(self, node: Intermediate | Param) -> sympy.Expr:
-        print(f"{type(node)=},")
+        # print(f"{type(node)=},")
 
         if isinstance(node, Param):
             param_name = self.arg_names[node.idx]
@@ -2960,17 +2993,17 @@ class SymbolicAnalyzer:
             assert op_list is not None
             op = op_list[0]
             name = op.name
-            print(f"{name=}")
+            # print(f"{name=}")
 
             handler = self.op_handlers.get(name)
             if handler is None:
-                print(">" * 4 + f" need handler for {op.name}")
+                # print(">" * 4 + f" need handler for {op.name}")
                 raise SymbolicFailure(op.name)
 
             result = handler(op)
         else:
             # TODO: Error handling needed here?
-            print(f"Need handler for {type(node)=}")
+            # print(f"Need handler for {type(node)=}")
             raise SymbolicFailure("")
 
         self.recursion_cache[cache_key] = result
