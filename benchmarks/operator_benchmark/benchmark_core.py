@@ -382,16 +382,24 @@ class BenchmarkRunner:
         """This function runs forward path of an op to get an output. Then the backward path is executed
         and the execution time is reported
         """
-        test_case.run_forward(num_runs=1, print_per_iter=False, cuda_sync=False)
+        test_case.run_forward(num_runs=1, print_per_iter=False, cuda_sync=True)
         test_case._output_mean()
-        backward_time = timeit.timeit(
-            lambda: (
-                test_case.run_backward(iters, print_per_iter),
-                torch.cuda.synchronize(),
-            ),
-            number=1,
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        func = test_case.run_backward
+        # Stable timing with Timer
+        timer = Timer(
+            stmt="func(iters, print_per_iter, cuda_sync)",
+            globals={
+                "func": func,
+                "iters": iters,
+                "print_per_iter": print_per_iter,
+                "cuda_sync": True,
+            },
         )
-        return backward_time
+        result = timer.adaptive_autorange(min_run_time=0.0001)
+        return result.median * iters
 
     def _measure_metrics(self, launch_test, test_case, iters, print_per_iter):
         """
