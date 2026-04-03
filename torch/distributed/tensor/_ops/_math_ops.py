@@ -1413,6 +1413,73 @@ def softmax_backward_strategy(op_schema: OpSchema) -> OpStrategy:
     return grad_in_strategy
 
 
+# @register_single_dim_strategy(
+#     [aten.nll_loss_forward.default, aten.nll_loss2d_forward.default],
+#     schema_info=RuntimeSchemaInfo(3),
+#     allow_uneven_sharding=True,
+# )
+def nll_loss_forward_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """nll_loss_forward: (input, target, weight, reduction, ignore_index) -> (output, total_weight)
+
+    input: (N, C, ...) or (C,), target: (N, ...) or ()
+    - Shard on non-channel dims (batch + spatial)
+    - Weight is always Replicate
+    - reduction=none: output follows target shape
+    - reduction=sum/mean: output is scalar (Partial)
+    """
+    input_meta = args_schema[0]
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    ndim = len(input_meta.shape)
+    channel_dim = 1 if ndim >= 2 else 0
+    reduction = cast(int, args_schema[3])
+
+    num_tensor_inputs = sum(1 for a in args_schema if isinstance(a, TensorMeta))
+    # weight (arg 2) may be None → not counted in num_tensor_inputs
+    has_weight = isinstance(args_schema[2], TensorMeta)
+
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
+
+    if reduction == Reduction.NONE.value:
+        # Output has same shape as target (input without channel dim)
+        for d in range(ndim):
+            if d == channel_dim:
+                continue
+            # target dim = d if d < channel_dim else d - 1
+            target_d = d if d < channel_dim else d - 1
+            out_d = target_d  # output follows target
+            rule: list[Placement | _ShardingPlaceholder] = []
+            rule.append(_ShardingPlaceholder(out_d))  # output
+            rule.append(Replicate())  # total_weight is always scalar Replicate
+            rule.append(_ShardingPlaceholder(d))  # input
+            rule.append(_ShardingPlaceholder(target_d))  # target
+            if has_weight:
+                rule.append(Replicate())  # weight
+            strategies.append(rule)
+    else:
+        # reduction=sum or mean: output is scalar, total_weight is scalar
+        # Shard on non-channel dims → output is Partial
+        reduction_op = "sum"  # both sum and mean use Partial("sum") initially
+        for d in range(ndim):
+            if d == channel_dim:
+                continue
+            target_d = d if d < channel_dim else d - 1
+            rule = []
+            rule.append(Partial(reduction_op))  # output
+            rule.append(Partial("sum"))  # total_weight
+            rule.append(_ShardingPlaceholder(d))  # input
+            rule.append(_ShardingPlaceholder(target_d))  # target
+            if has_weight:
+                rule.append(Replicate())  # weight
+            strategies.append(rule)
+
+    return strategies
+
+
 @register_op_strategy(
     [aten.nll_loss_forward.default, aten.nll_loss2d_forward.default],
     schema_info=RuntimeSchemaInfo(3),
@@ -1539,6 +1606,54 @@ def nll_loss_forward_strategy(op_schema: OpSchema) -> OpStrategy:
         )
 
     return output_strategy
+
+
+# @register_single_dim_strategy(
+#     [aten.nll_loss_backward.default, aten.nll_loss2d_backward.default],
+#     schema_info=RuntimeSchemaInfo(4),
+#     allow_uneven_sharding=True,
+# )
+def nll_loss_backward_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """nll_loss_backward: (grad_out, input, target, weight, reduction, ignore_index, total_weight) -> grad_input
+
+    grad_input has same shape as input. Shard on non-channel dims.
+    - reduction=none: grad_out follows target shape, shards on same dim
+    - reduction=sum/mean: grad_out is scalar, must be Replicate
+    """
+    input_meta = args_schema[1]  # input is arg 1
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    ndim = len(input_meta.shape)
+    channel_dim = 1 if ndim >= 2 else 0
+    reduction = cast(int, args_schema[4])
+    has_weight = isinstance(args_schema[3], TensorMeta)
+
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
+
+    for d in range(ndim):
+        if d == channel_dim:
+            continue
+        target_d = d if d < channel_dim else d - 1
+        rule: list[Placement | _ShardingPlaceholder] = []
+        rule.append(_ShardingPlaceholder(d))  # grad_input (output)
+
+        if reduction == Reduction.NONE.value:
+            rule.append(_ShardingPlaceholder(target_d))  # grad_out follows target
+        else:
+            rule.append(Replicate())  # grad_out is scalar when reduced
+
+        rule.append(_ShardingPlaceholder(d))  # input
+        rule.append(_ShardingPlaceholder(target_d))  # target
+        if has_weight:
+            rule.append(Replicate())  # weight
+        rule.append(Replicate())  # total_weight
+        strategies.append(rule)
+
+    return strategies
 
 
 @register_op_strategy(
@@ -1817,6 +1932,82 @@ def _common_norm_forward_strategy(
     return output_strategy
 
 
+def _norm_forward_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+    rms_norm: bool = False,
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """Single-dim strategy for layer_norm / rms_norm forward.
+
+    Input shards on outer dims (d < axis), replicate on inner dims.
+    Weight and bias are always Replicate. All outputs shard on the same outer dim.
+
+    layer_norm: args = (input, normalized_shape, weight, bias, eps)
+                outputs = (out, mean, rstd) → 3 outputs
+    rms_norm:   args = (input, normalized_shape, weight, eps)
+                outputs = (out, rstd) → 2 outputs
+    """
+    input_meta = args_schema[0]
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    ndim = len(input_meta.shape)
+
+    normalized_shape = args_schema[1]
+    if not isinstance(normalized_shape, (int, Sequence, torch.Size)):
+        raise AssertionError(
+            f"Expected int, Sequence, or torch.Size, got {type(normalized_shape)}"
+        )
+    normalized_size = normalize_to_torch_size(normalized_shape)
+    axis = ndim - len(normalized_size)
+
+    num_outputs = 2 if rms_norm else 3  # (out, rstd) or (out, mean, rstd)
+
+    # Count tensor inputs: input is always present, weight/bias may be None
+    num_tensor_inputs = sum(1 for a in args_schema if isinstance(a, TensorMeta))
+
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
+    for d in range(axis):
+        # All outputs shard on d, input shards on d, weight/bias are Replicate
+        rule: list[Placement | _ShardingPlaceholder] = [
+            _ShardingPlaceholder(d)
+        ] * num_outputs  # outputs
+        rule.append(_ShardingPlaceholder(d))  # input
+        # weight and bias (if present) are always Replicate
+        for _ in range(num_tensor_inputs - 1):
+            rule.append(Replicate())
+        strategies.append(rule)
+    return strategies
+
+
+# @register_single_dim_strategy(
+#     [aten.native_layer_norm.default],
+#     schema_info=RuntimeSchemaInfo(1),
+#     allow_uneven_sharding=True,
+# )
+def layer_norm_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    return _norm_forward_single_dim_strategy(op, args_schema, kwargs_schema)
+
+
+# @register_single_dim_strategy(
+#     [aten._fused_rms_norm.default],
+#     schema_info=RuntimeSchemaInfo(1),
+#     allow_uneven_sharding=True,
+# )
+def fused_rms_norm_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    return _norm_forward_single_dim_strategy(
+        op, args_schema, kwargs_schema, rms_norm=True
+    )
+
+
 @register_op_strategy(
     [aten.native_layer_norm.default],
     schema_info=RuntimeSchemaInfo(1),
@@ -2035,6 +2226,119 @@ def _common_norm_backward_strategy(
         )
 
     return out_tuple_strategy
+
+
+def _norm_backward_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+    rms_norm: bool = False,
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    """Single-dim strategy for layer_norm / rms_norm backward.
+
+    layer_norm_backward: args = (grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask)
+                         outputs = (d_input, d_weight, d_bias)
+    rms_norm_backward:   args = (grad_out, input, normalized_shape, rstd, weight, output_mask)
+                         outputs = (d_input, d_weight)
+
+    For outer dim d:
+    - d_input: Shard(d) (same shape as input)
+    - d_weight: Partial("sum") (reduced over outer dims)
+    - d_bias: Partial("sum") (reduced over outer dims) [layer_norm only]
+    - grad_out, input: Shard(d)
+    - mean, rstd: Shard(d) (outer dims only)
+    - weight, bias: Replicate
+    """
+    if not rms_norm:
+        # grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
+        input_meta = args_schema[1]  # input is arg 1
+        normalized_shape = args_schema[2]
+        output_mask = args_schema[7]
+    else:
+        # grad_out, input, normalized_shape, rstd, weight, output_mask
+        input_meta = args_schema[1]
+        normalized_shape = args_schema[2]
+        output_mask = args_schema[5]
+
+    if not isinstance(input_meta, TensorMeta):
+        raise AssertionError(f"Expected TensorMeta, got {type(input_meta)}")
+    ndim = len(input_meta.shape)
+
+    if not isinstance(normalized_shape, (int, Sequence, torch.Size)):
+        raise AssertionError(
+            f"Expected int, Sequence, or torch.Size, got {type(normalized_shape)}"
+        )
+    normalized_size = normalize_to_torch_size(normalized_shape)
+    axis = ndim - len(normalized_size)
+
+    # Count actual tensor inputs and determine output count
+    num_tensor_inputs = sum(1 for a in args_schema if isinstance(a, TensorMeta))
+    # Outputs: d_input always, d_weight if output_mask[1], d_bias if output_mask[2] (layer_norm only)
+    num_outputs = sum(1 for r in op._schema.returns if "Tensor" in str(r.type))
+
+    strategies: list[list[Placement | _ShardingPlaceholder]] = []
+    for d in range(axis):
+        rule: list[Placement | _ShardingPlaceholder] = []
+
+        # Outputs: d_input shards on d, d_weight/d_bias are Partial("sum")
+        rule.append(_ShardingPlaceholder(d))  # d_input
+        if output_mask[1]:
+            rule.append(Partial("sum"))  # d_weight
+        else:
+            rule.append(Replicate())  # d_weight masked out
+        if not rms_norm:
+            if output_mask[2]:
+                rule.append(Partial("sum"))  # d_bias
+            else:
+                rule.append(Replicate())  # d_bias masked out
+
+        # Inputs: grad_out and input shard on d, mean/rstd shard on d,
+        # weight/bias are Replicate
+        for a in args_schema:
+            if isinstance(a, TensorMeta):
+                a_ndim = len(a.shape)
+                if a_ndim >= ndim:
+                    # Full-rank tensor (grad_out, input): shard on outer dim
+                    rule.append(_ShardingPlaceholder(d))
+                else:
+                    # Reduced-rank tensor (mean, rstd) or 1D (weight, bias)
+                    if a_ndim > axis:
+                        # mean/rstd have shape = input_shape[:axis], shard on d
+                        rule.append(_ShardingPlaceholder(d))
+                    else:
+                        # weight/bias: always Replicate
+                        rule.append(Replicate())
+
+        strategies.append(rule)
+    return strategies
+
+
+# @register_single_dim_strategy(
+#     [aten.native_layer_norm_backward.default],
+#     schema_info=RuntimeSchemaInfo(2),
+#     allow_uneven_sharding=True,
+# )
+def layer_norm_bwd_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    return _norm_backward_single_dim_strategy(op, args_schema, kwargs_schema)
+
+
+# @register_single_dim_strategy(
+#     [aten._fused_rms_norm_backward.default],
+#     schema_info=RuntimeSchemaInfo(2),
+#     allow_uneven_sharding=True,
+# )
+def fused_rms_norm_bwd_single_dim_strategy(
+    op: torch._ops.OpOverload,
+    args_schema: tuple[Any, ...],
+    kwargs_schema: dict[str, Any],
+) -> list[list[Placement | _ShardingPlaceholder]]:
+    return _norm_backward_single_dim_strategy(
+        op, args_schema, kwargs_schema, rms_norm=True
+    )
 
 
 @register_op_strategy(
