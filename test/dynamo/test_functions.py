@@ -3348,10 +3348,10 @@ class GraphModule(torch.nn.Module):
         l_x_ = L_x_
 
         mul: "f32[2, 2]" = l_x_ * 4
-        mul_1: "f32[2, 2]" = mul * l_x_;  mul = None
-        mul_2: "f32[2, 2]" = 20 * l_x_;  l_x_ = None
+        mul_1: "f32[2, 2]" = 20 * l_x_
+        mul_2: "f32[2, 2]" = mul * l_x_;  mul = l_x_ = None
 
-        mul_3: "f32[2, 2]" = torch.mul(mul_1, mul_2);  mul_1 = mul_2 = None
+        mul_3: "f32[2, 2]" = torch.mul(mul_2, mul_1);  mul_2 = mul_1 = None
         return (mul_3,)
 """,
             )
