@@ -34,27 +34,82 @@ def is_impure_node_for_dce(node: fx.Node) -> bool:
     return node.is_impure(impure_random)
 
 
-def _is_backward_node(node: fx.Node) -> bool:
-    """Check if node is in backward region via annotation"""
-    return node.meta.get("custom", {}).get("remat_pass_tag", None) == "is_backward"
+def _is_backward_node(node: fx.Node, use_phase_only: bool = False) -> bool:
+    """Check if node is in backward region.
+
+    If use_phase_only is True, only checks custom["phase"] == "backward"
+    (user annotation). Otherwise falls back to custom["autograd_backward"]
+    (set by _patch_autograd_grad).
+    """
+    custom = node.meta.get("custom", {})
+    if use_phase_only:
+        return custom.get("phase") == "backward"
+    return custom.get("autograd_backward", False)
+
+
+def _has_user_phase_annotation(gm: fx.GraphModule) -> bool:
+    """Check if any node has the user-level phase: backward annotation."""
+    return any(
+        node.meta.get("custom", {}).get("phase") == "backward"
+        for node in gm.graph.nodes
+    )
+
+
+def _count_backward_regions(gm: fx.GraphModule, use_phase_only: bool = False) -> int:
+    """Count the number of contiguous backward regions in the graph."""
+    count = 0
+    in_backward = False
+    for node in gm.graph.nodes:
+        is_bwd = _is_backward_node(node, use_phase_only=use_phase_only)
+        if is_bwd and not in_backward:
+            count += 1
+        in_backward = is_bwd
+    return count
 
 
 def remat_using_tags_for_fwd_loss_bwd_graph(gm: fx.GraphModule) -> fx.GraphModule:
     """
-    Duplicate recompute nodes for backward use. DCE removes unused forward versions. We assume that
-    you already annotated your backward region with fx.traceback.annotate({"remat_pass_tag": "is_backward"})
-    which helps us identify the backward region.
+    Duplicate recompute nodes for backward use. DCE removes unused forward versions.
+
+    Backward nodes are identified by custom["phase"] == "backward" (user annotation)
+    or custom["autograd_backward"] == True (set automatically by _patch_autograd_grad).
+    When the user provides phase annotations, only those are used.
+
+    Only a single contiguous backward region is supported. If multiple backward
+    regions are detected (whether from multiple autograd.grad calls or multiple
+    user annotations), an error is raised.
     """
     if not has_recomputable_ops(gm):
         return gm
 
+    use_phase_only = _has_user_phase_annotation(gm)
+
+    num_regions = _count_backward_regions(gm, use_phase_only=use_phase_only)
+    if num_regions > 1:
+        if use_phase_only:
+            raise RuntimeError(
+                f"Detected {num_regions} backward regions annotated with "
+                'phase: "backward" but remat only supports a single backward region. '
+                "Please ensure only one contiguous region is annotated."
+            )
+        raise RuntimeError(
+            f"Detected {num_regions} backward regions in the graph but remat only supports "
+            "a single backward region. This can happen when the traced function contains "
+            "multiple torch.autograd.grad calls. Please annotate the real backward with "
+            'torch.fx.traceback.annotate({"phase": "backward"}).'
+        )
+
     # Find backward boundary and build ordering
     bwd_start: int | None = None
+    bwd_node_set: set[fx.Node] = set()
     order = {}
     for idx, node in enumerate(gm.graph.nodes):
         order[node] = idx
-        if _is_backward_node(node) and bwd_start is None:
-            bwd_start = idx
+        if _is_backward_node(node, use_phase_only=use_phase_only):
+            if use_phase_only:
+                bwd_node_set.add(node)
+            if bwd_start is None:
+                bwd_start = idx
 
     if bwd_start is None:
         return gm
@@ -107,7 +162,12 @@ def remat_using_tags_for_fwd_loss_bwd_graph(gm: fx.GraphModule) -> fx.GraphModul
         return deps
 
     # Insert backward nodes
+    # When use_phase_only, only process nodes explicitly tagged with phase: backward.
+    # Otherwise, treat everything from bwd_start onwards as backward.
     for node in list(gm.graph.nodes)[bwd_start:]:
+        if use_phase_only and node not in bwd_node_set:
+            env[node] = new_graph.node_copy(node, lambda x: env[x])
+            continue
         # Gather all deps that need to be recomputed for this node
         deps = gather_recompute_deps(node)
 

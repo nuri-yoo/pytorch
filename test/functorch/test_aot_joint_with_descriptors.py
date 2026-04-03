@@ -237,6 +237,7 @@ class inner_f(torch.nn.Module):
         le: "b8[2, 3, 4, 4]" = torch.ops.prims.le.default(add_4, 0.0)
         where: "f32[2, 3, 4, 4]" = torch.ops.prims.where.default(le, 0.0, add_4);  le = add_4 = None
         view_of: "f32[2, 3, 4, 4]" = torch.ops.prims.view_of.default(where)
+
         view_of_1: "f32[2, 3, 4, 4]" = torch.ops.prims.view_of.default(view_of);  view_of = None
         le_1: "b8[2, 3, 4, 4]" = torch.ops.prims.le.default(view_of_1, 0.0);  view_of_1 = None
         where_1: "f32[2, 3, 4, 4]" = torch.ops.prims.where.default(le_1, 0.0, tangents_1);  le_1 = tangents_1 = None
@@ -452,6 +453,7 @@ class inner_f(torch.nn.Module):
         mul_3: "f32[4]" = torch.ops.prims.mul.default(primals_4, 1.0);  primals_4 = None
         broadcast_in_dim_1: "f32[4, 4]" = torch.ops.prims.broadcast_in_dim.default(mul_3, [4, 4], [1]);  mul_3 = None
         add_1: "f32[4, 4]" = torch.ops.prims.add.default(mul_2, broadcast_in_dim_1);  mul_2 = broadcast_in_dim_1 = None
+
         transpose_2: "f32[4, 4]" = torch.ops.prims.transpose.default(tangents_2, [1, 0])
         mm_2: "f32[4, 3]" = torch.ops.aten.mm.default(transpose_2, primals_5);  transpose_2 = None
         transpose_3: "f32[3, 4]" = torch.ops.prims.transpose.default(mm_2, [1, 0]);  mm_2 = None
@@ -965,6 +967,7 @@ class inner_f(torch.nn.Module):
 ('call_function', 'mul', {'pp_stage': 1})
 ('call_function', 'mul_1', {'pp_stage': 1})
 ('call_function', 'mul_2', {'pp_stage': 1})
+('call_function', 'add', {'autograd_backward': True})
 ('call_function', 't_1', {'pp_stage': 0})
 ('call_function', 'mm', {'pp_stage': 0})
 ('call_function', 't_2', {'pp_stage': 0})
@@ -1114,7 +1117,9 @@ class inner_f(torch.nn.Module):
         self.assertEqual(len(add_nodes), 1)
         gradient_acc_node = add_nodes[0]
         self.assertTrue(gradient_acc_node.meta["is_gradient_acc"])
-        self.assertEqual(gradient_acc_node.meta.get("custom", {}), {})
+        self.assertEqual(
+            gradient_acc_node.meta.get("custom", {}), {"autograd_backward": True}
+        )
         custom_metadata = fx_traceback._get_custom_metadata(graph_module)
         self.assertExpectedInline(
             str(custom_metadata),
@@ -1140,6 +1145,7 @@ class inner_f(torch.nn.Module):
 ('call_function', 't_8', {'test': 1})
 ('call_function', 'sum_2', {'test': 1})
 ('call_function', 'view_1', {'test': 1})
+('call_function', 'add', {'autograd_backward': True})
 ('call_function', 't_9', {'test': 1})""",
         )
 

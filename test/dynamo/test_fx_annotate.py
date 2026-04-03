@@ -60,6 +60,7 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         self.assertExpectedInline(
             str(bw_metadata),
             """\
+('call_function', 'div_1', {'autograd_backward': True})
 ('call_function', 'mul_1', {'pp_stage': 0, 'cuda_stream': 2, 'fsdp_bucket': 1})
 ('call_function', 'cos', {'pp_stage': 0, 'fdsp_bucket': 0})
 ('call_function', 'mul_2', {'pp_stage': 0, 'fdsp_bucket': 0})""",  # noqa: B950
@@ -97,11 +98,15 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         )
         self.assertExpectedInline(
             str(fw_metadata),
-            """('call_function', 'sin', {'ac_sin': 0})""",  # noqa: B950
+            """\
+('call_function', 'sin', {'ac_sin': 0})
+('call_function', 'detach_2', {'autograd_backward': True})""",  # noqa: B950
         )
         self.assertExpectedInline(
             str(bw_metadata),
             """\
+('placeholder', 'detach_2', {'autograd_backward': True})
+('call_function', 'sigmoid_backward', {'autograd_backward': True})
 ('call_function', 'cos', {'ac_sin': 0})
 ('call_function', 'mul', {'ac_sin': 0})""",  # noqa: B950
         )
@@ -135,11 +140,15 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         )
         self.assertExpectedInline(
             str(fw_metadata),
-            """('call_function', 'sin', {'stage': 0})""",  # noqa: B950
+            """\
+('call_function', 'sin', {'stage': 0})
+('call_function', 'detach_4', {'autograd_backward': True})""",  # noqa: B950
         )
         self.assertExpectedInline(
             str(bw_metadata),
             """\
+('placeholder', 'detach_4', {'autograd_backward': True})
+('call_function', 'sigmoid_backward', {'autograd_backward': True})
 ('call_function', 'cos', {'stage': 0})
 ('call_function', 'mul', {'stage': 0})""",  # noqa: B950
         )
@@ -282,6 +291,7 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         self.assertExpectedInline(
             str(bw_metadata),
             """\
+('call_function', 'div_1', {'autograd_backward': True})
 ('call_function', 'mul_1', {'pp_stage': 0})
 ('call_function', 'cos', {'pp_stage': 0, 'fdsp_bucket': 0})
 ('call_function', 'mul_2', {'pp_stage': 0, 'fdsp_bucket': 0})""",  # noqa: B950

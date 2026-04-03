@@ -126,6 +126,7 @@ def _create_graph(
     with (
         enable_python_dispatcher(),
         ctx,
+        torch.compiler._patch_autograd_grad(),
     ):
         fx_g = make_fx(
             inner_f,
