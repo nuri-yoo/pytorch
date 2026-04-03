@@ -1425,6 +1425,8 @@ Call to `torch._dynamo.graph_break()`
 
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
+Source of graph break:
+            torch._dynamo.graph_break()
 User code traceback:
   File "test_error_messages.py", line N, in test_latest_bytecode_to_graph_break_python_versioning
     fn(torch.ones(3))
