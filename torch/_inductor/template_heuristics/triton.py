@@ -2832,6 +2832,18 @@ class ROCmAddMMTemplateConfigHeuristic(AddMMConfigMixin, ROCmMMTemplateConfigHeu
     """Addmm specific mixin for ROCm"""
 
 
+@register_template_heuristic(
+    persistent_mm_template.uid,
+    "cuda",
+    register=torch.version.hip is not None,
+    op_name="addmm",
+)
+class ROCmAddMMPersistentTemplateConfigHeuristic(
+    AddMMConfigMixin, PersistentMMTemplateConfigHeuristic
+):
+    """Addmm specific mixin for persistent MM on ROCm"""
+
+
 # TODO(coconutruben): deprecate once autoheuristic is deprecated
 @register_template_heuristic("mm-ah", "cuda", register=torch.version.hip is not None)
 class ROCmMMAHTemplateConfigHeuristic(MMTemplateConfigMixin, ROCmConfigHeuristic):
