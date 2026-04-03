@@ -3,6 +3,7 @@
 import contextlib
 import json
 import logging
+import re
 import sys
 import tempfile
 import unittest
@@ -1305,6 +1306,45 @@ class ComboKernelTestsMaxAutotune(TestCase):
 
         chained_logs = [msg for msg in cm.output if "Combo sequential autotune" in msg]
         self.assertGreater(len(chained_logs), 0)
+        self.assertEqual(out_eager, out_compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_gpu_and_triton
+    def test_combo_autotune_grouping(self):
+        def fn(a, b, c, d):
+            return a.cos(), b.sin(), c.exp(), d.neg()
+
+        # a,b: numel=262144 → bs=1024, c,d: numel=32 → bs=256
+        # Different bs → different configs → separate groups
+        inps = [
+            torch.rand(4, 65536, device=GPU_TYPE),
+            torch.rand(4, 65536, device=GPU_TYPE),
+            torch.rand(4, 8, device=GPU_TYPE),
+            torch.rand(4, 8, device=GPU_TYPE),
+        ]
+
+        out_eager = fn(*inps)
+        fn_c = torch.compile(fn)
+
+        logger = logging.getLogger("torch._inductor.runtime.triton_heuristics")
+        with self.assertLogs(logger, level=logging.DEBUG) as cm:
+            out_compiled, code = run_and_get_code(fn_c, *inps)
+
+        # Parse "Phase 1 group N SK[...]" lines to check grouping
+        group_lines = [
+            msg for msg in cm.output if "Phase 1 group" in msg and "SK[" in msg
+        ]
+        group_indices = {
+            int(re.search(r"group (\d+)", line).group(1))
+            for line in group_lines
+            if re.search(r"group (\d+)", line)
+        }
+        # 2 groups (not 4) — identical configs are grouped together
+        self.assertEqual(
+            len(group_indices),
+            2,
+            f"Expected 2 groups, got {len(group_indices)}: {group_lines}",
+        )
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
