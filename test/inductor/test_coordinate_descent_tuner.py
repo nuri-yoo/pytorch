@@ -113,6 +113,18 @@ class TestCoordinateDescentTuner(TestCase):
         self.assertFalse(tuner.value_too_large("R0_BLOCK", max_block["R0_"]))
         self.assertTrue(tuner.value_too_large("R0_BLOCK", max_block["R0_"] * 2))
 
+    def test_value_too_large_suffixed_block_keys(self):
+        size_hints = {"x": 2**20, "y": 2**20}
+        tuner = CoordescTuner(size_hints=size_hints)
+
+        max_block = TRITON_MAX_BLOCK
+        self.assertFalse(tuner.value_too_large("XBLOCK_0", max_block["X"]))
+        self.assertTrue(tuner.value_too_large("XBLOCK_0", max_block["X"] * 2))
+        self.assertFalse(tuner.value_too_large("XBLOCK_2", max_block["X"]))
+        self.assertTrue(tuner.value_too_large("XBLOCK_2", max_block["X"] * 2))
+        self.assertFalse(tuner.value_too_large("R0_BLOCK_1", max_block["R0_"]))
+        self.assertTrue(tuner.value_too_large("R0_BLOCK_1", max_block["R0_"] * 2))
+
 
 if __name__ == "__main__":
     if IS_LINUX and HAS_GPU:

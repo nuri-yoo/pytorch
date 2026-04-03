@@ -1348,6 +1348,48 @@ class ComboKernelTestsMaxAutotune(TestCase):
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
+    @requires_gpu_and_triton
+    def test_combo_kernel_coordesc_tuning(self):
+        def fn(a, b, c):
+            a1 = torch.nn.functional.relu(a)
+            b1 = torch.nn.functional.sigmoid(b)
+            c1 = torch.nn.functional.tanh(c)
+            return a1, b1, c1
+
+        inps = [
+            torch.rand(32, 1024, device=GPU_TYPE),
+            torch.rand(64, 512, device=GPU_TYPE),
+            torch.rand(16, 2048, device=GPU_TYPE),
+        ]
+
+        out_eager = fn(*inps)
+
+        logger = logging.getLogger("torch._inductor.runtime.coordinate_descent_tuner")
+        with torch._inductor.config.patch(coordinate_descent_tuning=True):
+            with self.assertLogs(logger, level=logging.DEBUG) as cm:
+                out_compiled = torch.compile(fn)(*inps)
+
+        self.assertEqual(out_eager, out_compiled)
+
+        # Verify coordesc actually tried varying suffixed block keys.
+        # Without the combo kernel coordesc impl, only num_warps is tuned —
+        # suffixed keys like XBLOCK_0 are not in tunable_fields.
+        try_logs = [msg for msg in cm.output if "Try config" in msg]
+        block_values: list[dict[str, int]] = []
+        for msg in try_logs:
+            vals = {
+                m.group(1): int(m.group(2))
+                for m in re.finditer(r"(\w+BLOCK_\d+): (\d+)", msg)
+            }
+            if vals:
+                block_values.append(vals)
+        distinct_block_cfgs = {tuple(sorted(v.items())) for v in block_values}
+        self.assertGreater(
+            len(distinct_block_cfgs),
+            1,
+            "Coordinate descent did not explore different suffixed block sizes. ",
+        )
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests

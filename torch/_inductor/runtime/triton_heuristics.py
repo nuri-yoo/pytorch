@@ -1322,6 +1322,7 @@ class CachingAutotuner(KernelInterface):
         start_time = time.time_ns()
         best_time = self.bench(launcher, *args, **kwargs)
         counters["inductor"]["combo_autotune_bench"] += 1
+        self.coordesc_tuner.cache_benchmark_result(launcher.config, best_time)
         log.debug(
             "  Phase 1 baseline: %s warps=%d time=%f",
             dict(current_kwargs),
@@ -1371,6 +1372,7 @@ class CachingAutotuner(KernelInterface):
                     ).make_launcher()
                 trial_time = self.bench(trial_launcher, *args, **kwargs)
                 counters["inductor"]["combo_autotune_bench"] += 1
+                self.coordesc_tuner.cache_benchmark_result(trial_config, trial_time)
 
                 improved = trial_time < best_time
                 log.debug(
@@ -1419,6 +1421,7 @@ class CachingAutotuner(KernelInterface):
                 trial_launcher = self._precompile_config(trial_config).make_launcher()
             trial_time = self.bench(trial_launcher, *args, **kwargs)
             counters["inductor"]["combo_autotune_bench"] += 1
+            self.coordesc_tuner.cache_benchmark_result(trial_config, trial_time)
 
             improved = trial_time < best_time
             log.debug(
@@ -2939,6 +2942,7 @@ def _handle_combo_kernel_per_subkernel_blocks(
     }
 
     combined_kwargs: dict[str, int] = {}
+    combined_size_hints: dict[str, int] = {}
     all_num_warps: list[int] = []
     all_num_stages: list[int] = []
     unique_warp_stage_pairs: OrderedSet[tuple[int, int]] = OrderedSet()
@@ -2949,6 +2953,8 @@ def _handle_combo_kernel_per_subkernel_blocks(
     for i in range(num_kernels):
         subkernel_heuristic = combo_meta[f"heuristic_{i}"]
         size_hints_i = combo_meta[f"size_hints_{i}"]
+        for prefix, value in size_hints_i.items():
+            combined_size_hints[prefix] = max(combined_size_hints.get(prefix, 0), value)
 
         if subkernel_heuristic == "pointwise":
             cfgs = pointwise(
@@ -3009,6 +3015,7 @@ def _handle_combo_kernel_per_subkernel_blocks(
             }
 
     unique_warp_stage_pairs.add((max(all_num_warps), max(all_num_stages)))
+    inductor_meta["combo_size_hints"] = combined_size_hints
 
     combo_tuning_groups = list(group_map.values())
     # Largest sub-kernels tuned first — they dominate runtime and get most freedom
@@ -3147,7 +3154,7 @@ def pointwise(
     )
     if configs is not None:
         return cached_autotune(
-            None,
+            inductor_meta.get("combo_size_hints"),
             configs,
             triton_meta=triton_meta,
             inductor_meta=inductor_meta,
@@ -3815,7 +3822,7 @@ def reduction(
     )
     if configs is not None:
         return cached_autotune(
-            None,
+            inductor_meta.get("combo_size_hints"),
             configs,
             triton_meta=triton_meta,
             inductor_meta=inductor_meta,
@@ -4057,7 +4064,7 @@ def persistent_reduction(
     )
     if configs is not None:
         return cached_autotune(
-            None,
+            inductor_meta.get("combo_size_hints"),
             configs,
             triton_meta=triton_meta,
             inductor_meta=inductor_meta,
