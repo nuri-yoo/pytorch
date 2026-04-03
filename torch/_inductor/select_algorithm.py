@@ -512,6 +512,7 @@ class TritonTemplateKernel(TritonKernel):
         hint_override: int | None = None,
         triton_meta: dict[str, object] | None = None,
         always_freeze_layout: bool = False,
+        index_dtype_override: str | None = None,
     ) -> None:
         if tma_store:
             pass
@@ -582,6 +583,7 @@ class TritonTemplateKernel(TritonKernel):
         self.epilogue_fn = epilogue_fn
         self.render_hooks = {}  # type: ignore[var-annotated]
         self.triton_meta: dict[str, object] | None = triton_meta
+        self._index_dtype_override = index_dtype_override
         # For Templated Attention this can be a list of ir.Subgraph
         self.subgraphs: list[ir.ComputedBuffer] | None = subgraphs
 
@@ -827,10 +829,11 @@ class TritonTemplateKernel(TritonKernel):
             return "@triton.jit"
 
         argdefs, _, signature, _ = self.args.python_argdefs()
+        size_dtype = self._index_dtype_override or self.index_dtype
         triton_meta: dict[str, Any] = {
             "signature": signature_to_meta(
                 signature,
-                size_dtype=self.index_dtype,
+                size_dtype=size_dtype,
                 argdefs=argdefs,
                 is_template=True,
             ),
@@ -2599,6 +2602,7 @@ class TritonTemplate(KernelTemplate):
             "subgraphs": subgraphs,
             "prologue_loads_all_inputs": self.prologue_loads_all_inputs,
             "always_freeze_layout": self.always_freeze_layout,
+            "index_dtype_override": index_dtype,
         }
 
         if HAS_WARP_SPEC:
