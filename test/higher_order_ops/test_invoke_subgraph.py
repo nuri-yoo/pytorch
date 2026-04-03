@@ -3907,6 +3907,66 @@ class GraphModule(torch.nn.Module):
         # second call should reuse the first trace.
         self.assertEqual(count(), 1)
 
+    def test_nested_compile_regions_kwarg(self):
+        """torch.compile nested_compile_regions kwarg wraps specified classes."""
+
+        class Layer(torch.nn.Module):
+            def __init__(self, c):
+                super().__init__()
+                self.c = c
+
+            def forward(self, x):
+                return x * self.c
+
+        model = torch.nn.Sequential(Layer(5), Layer(5), Layer(5))
+
+        x = torch.randn(8)
+        ref = model(x)
+
+        with self._count_speculate_calls() as count:
+            res = torch.compile(
+                model,
+                backend="aot_eager",
+                fullgraph=True,
+                nested_compile_regions=[Layer],
+            )(x)
+
+        self.assertEqual(ref, res)
+        self.assertEqual(count(), 1)
+
+    def test_nested_compile_regions_kwarg_multiple_classes(self):
+        """torch.compile nested_compile_regions with multiple classes."""
+
+        class LinearBlock(torch.nn.Module):
+            def forward(self, x):
+                return x * 2
+
+        class ActivationBlock(torch.nn.Module):
+            def forward(self, x):
+                return x.sin()
+
+        model = torch.nn.Sequential(
+            LinearBlock(),
+            ActivationBlock(),
+            LinearBlock(),
+            ActivationBlock(),
+        )
+
+        x = torch.randn(8)
+        ref = model(x)
+
+        with self._count_speculate_calls() as count:
+            res = torch.compile(
+                model,
+                backend="aot_eager",
+                fullgraph=True,
+                nested_compile_regions=[LinearBlock, ActivationBlock],
+            )(x)
+
+        self.assertEqual(ref, res)
+        # One trace per class
+        self.assertEqual(count(), 2)
+
 
 @skipIfTorchDynamo("Not a torch._dynamo test")
 @parameterized_class(

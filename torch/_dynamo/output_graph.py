@@ -658,6 +658,9 @@ class OutputGraph(OutputGraphCommon):
 
         self.region_tracker = GraphRegionTracker()
         self._emit_debugger_breakpoint: bool = False
+        self.nested_compile_regions: list[type] = list(
+            compile_options.nested_compile_regions or []
+        )
 
         # tracked_fakes says where any tensor that was wrapped to fake came
         # from.  It is similar to GraphArg, in that all GraphArgs will get

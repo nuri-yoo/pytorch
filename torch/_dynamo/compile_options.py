@@ -26,3 +26,4 @@ class DynamoCompileOptions:
     recompile_limit: int | None = None
     package: CompilePackage | None = None
     compiler_config: Any | None = None
+    nested_compile_regions: list[type] | None = None

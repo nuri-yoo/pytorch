@@ -1131,6 +1131,22 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
             else nullcontext()
         )
         with ctx:
+            # Check if this module class should be treated as a nested
+            # compile region (set via torch.compile nested_compile_regions kwarg).
+            if (
+                name == "forward"
+                and isinstance(fn, types.FunctionType)
+                and tx.output.nested_compile_regions
+                and isinstance(mod, tuple(tx.output.nested_compile_regions))
+            ):
+                from torch._dynamo.utils import build_invoke_subgraph_variable
+
+                invoke_subgraph_var = build_invoke_subgraph_variable()
+                fn_vt = variables.UserFunctionVariable(fn, source=source)
+                return invoke_subgraph_var.call_function(
+                    tx, [fn_vt, self] + list(args), kwargs
+                )
+
             if not isinstance(fn, (types.FunctionType, torch.jit.ScriptFunction)):
                 fn_vt = VariableTracker.build(tx, fn, source=source, realize=True)
                 return fn_vt.call_function(tx, [self] + list(args), kwargs)
