@@ -1073,7 +1073,7 @@ def index_single_dim_strategy(
 
 
 @register_single_dim_strategy(
-    [aten.index_put.default, aten._index_put_impl_.default],
+    [aten.index_put.default, aten.index_put_.default, aten._index_put_impl_.default],
     schema_info=RuntimeSchemaInfo(needs_pytree=True),
 )
 def index_put_single_dim_strategy(
@@ -1096,9 +1096,10 @@ def index_put_single_dim_strategy(
       serves as an indexing coordinate into self. Each coordinate selects a
       tensor element, or a slice (if non-indexed dims exist).
 
-      values is a tensor that's broadcastable to (*broadcasted_shape, *non_indexed_dim_sizes).
-      Each position in broadcasted_shape selects a slice of values,
-      and writes it into the corresponding slice of self.
+      values is a tensor broadcastable to the indexing output shape.
+      When indexed dims are consecutive starting at dim k, this shape is
+      (*self[:k], *broadcast_shape, *self[k+n_indexed:]). When indexed
+      dims are non-consecutive, it is (*broadcast_shape, *non_indexed_dims).
 
     Sharding rules (possibly conservative and incomplete):
       - Index tensors: always Replicate (every rank needs all coordinates).
@@ -1107,10 +1108,6 @@ def index_put_single_dim_strategy(
         The exception is broadcasted value dimensions (size 1) - we require Replicate, but can shard self.
       - Additionally, we allow the full Partial rule on non-indexing tensors.
 
-    TODO(pianpwk): support non-contiguous indexed dims (None gaps in indices tuple,
-    e.g. (idx, None, idx)). Currently blocked by a single_dim_strategy infra bug:
-    _get_num_tensor_inputs counts None TupleStrategy children but args_strategy
-    drops them, causing a length mismatch in expand_to_full_mesh_op_strategy.
     """
     self_meta = cast(TensorMeta, args[0])
     indices_meta = cast(tuple[TensorMeta | None, ...], args[1])
@@ -1120,28 +1117,63 @@ def index_put_single_dim_strategy(
     indexed_dims = {i for i, idx in enumerate(indices_meta) if idx is not None}
     non_indexed_dims = [d for d in range(len(self_meta.shape)) if d not in indexed_dims]
     n_indexed = len(indexed_dims)
-    values_ndim = len(values_meta.shape)
 
     # Explicitly compute the broadcast shape of the index tensors.
-    # We could probably derive it in a smarter way, but this is more explicit.
     index_shapes = [idx.shape for idx in indices_meta if idx is not None]
     broadcast_ndim = len(torch.broadcast_shapes(*index_shapes)) if index_shapes else 0
 
-    # values shape = (*broadcast_shape, *non_indexed_dim_sizes)
-    # Strategy format: [output, input, *indices, value]
+    # Build values_dim → self_dim mapping. The values shape mirrors the
+    # aten.index output shape, whose layout depends on whether indexed
+    # dims are consecutive:
+    #   consecutive at dim k:  (*self[:k], *broadcast, *self[k+n:])
+    #   non-consecutive:       (*broadcast, *non_indexed_in_order)
+    sorted_indexed = sorted(indexed_dims)
+    all_consecutive = len(sorted_indexed) <= 1 or all(
+        sorted_indexed[i + 1] - sorted_indexed[i] == 1
+        for i in range(len(sorted_indexed) - 1)
+    )
+    insert_dim = sorted_indexed[0] if all_consecutive else 0
+
+    if all_consecutive:
+        values_to_self: list[int | None] = [
+            *range(insert_dim),
+            *([None] * broadcast_ndim),
+            *range(insert_dim + n_indexed, len(self_meta.shape)),
+        ]
+    else:
+        values_to_self = [
+            *([None] * broadcast_ndim),
+            *non_indexed_dims,
+        ]
+
+    # Strategy format: [output, self, *indices, values]
     # The infra flattens the indices list and drops None entries, so only
     # non-None index tensors get a placement slot (all Replicate).
+    #
+    # values may have fewer dims than the output (broadcasting adds
+    # implicit size-1 dims on the left), so align values dims to the
+    # right of values_to_self.
+    values_ndim = len(values_meta.shape)
+    output_ndim = len(values_to_self)
+    values_offset = output_ndim - values_ndim
+
     strategies: list[list[Placement | _ShardingPlaceholder]] = []
-    for values_dim in range(broadcast_ndim, values_ndim):
-        self_dim = non_indexed_dims[values_dim - broadcast_ndim]
+    for vd in range(values_ndim):
+        sd = values_to_self[vd + values_offset]
+        if sd is None:
+            # This values dim corresponds to a broadcast dim (from the
+            # index tensors), not a dim of self.
+            continue
+        # Size=1 dims in values are broadcast — replicate rather than shard.
+        values_placement: Placement | _ShardingPlaceholder = (
+            Replicate() if values_meta.shape[vd] == 1 else _ShardingPlaceholder(vd)
+        )
         strategies.append(
             [
-                _ShardingPlaceholder(self_dim),
-                _ShardingPlaceholder(self_dim),
-                *([Replicate()] * n_indexed),
-                Replicate()
-                if values_meta.shape[values_dim] == 1
-                else _ShardingPlaceholder(values_dim),
+                _ShardingPlaceholder(sd),  # output
+                _ShardingPlaceholder(sd),  # self
+                *([Replicate()] * n_indexed),  # *indices
+                values_placement,  # values
             ]
         )
 
