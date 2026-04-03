@@ -15,6 +15,7 @@ from torch._C._dynamo import (
     PyMappingSlots,
     PyNumberSlots,
     PySequenceSlots,
+    PyTypeSlots,
 )
 
 from .. import graph_break_hints
@@ -119,6 +120,12 @@ def type_implements_nb_index(obj_type: type) -> bool:
     """CPython's _PyIndex_Check: tp_as_number->nb_index != NULL."""
     _, _, num_slots, _ = _get_cached_slots(obj_type)
     return has_slot(num_slots, PyNumberSlots.NB_INDEX)
+
+
+def type_implements_tp_hash(obj_type: type) -> bool:
+    """Check whether obj_type has a real tp_hash (not PyObject_HashNotImplemented)."""
+    _, _, _, type_slots = _get_cached_slots(obj_type)
+    return has_slot(type_slots, PyTypeSlots.TP_HASH)
 
 
 def maybe_get_python_type(obj: VariableTracker) -> type:

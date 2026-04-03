@@ -336,8 +336,14 @@ int64_t get_pynumber_slots(PyTypeObject* type) {
 
 int64_t get_pytype_slots(PyTypeObject* type) {
   int64_t slots = 0;
-  if (PyType_GetSlot(type, Py_tp_hash) != nullptr)
-    slots |= (1LL << static_cast<int>(PyTypeSlotBit::TP_HASH));
+  // Exclude PyObject_HashNotImplemented — that sentinel means "unhashable",
+  // so TP_HASH should only be set for types with a real hash implementation.
+  {
+    auto* hash_fn = PyType_GetSlot(type, Py_tp_hash);
+    if (hash_fn != nullptr &&
+        hash_fn != reinterpret_cast<void*>(PyObject_HashNotImplemented))
+      slots |= (1LL << static_cast<int>(PyTypeSlotBit::TP_HASH));
+  }
   if (PyType_GetSlot(type, Py_tp_iter) != nullptr)
     slots |= (1LL << static_cast<int>(PyTypeSlotBit::TP_ITER));
   if (PyType_GetSlot(type, Py_tp_iternext) != nullptr)

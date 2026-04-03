@@ -138,7 +138,26 @@ class ConstDictVariable(VariableTracker):
             # We specialize SymNodes
             vt = specialize_symnode(vt)
 
-            # If Dynamo does not know the hashability of the vt, it will raise unsupported here
+            # CPython: dict_subscript calls _PyObject_HashFast which checks
+            # tp_hash != PyObject_HashNotImplemented before hashing.
+            # Check the C-level slot first — this catches all unhashable types
+            # (list, set, dict, etc.) without needing per-VT overrides.
+            from .object_protocol import _try_get_python_type, type_implements_tp_hash
+
+            vt_type = _try_get_python_type(vt)
+            if vt_type is not None and not type_implements_tp_hash(vt_type):
+                unimplemented(
+                    gb_type="unhashable dict key",
+                    context=f"dict[{vt_type.__name__}] — type has tp_hash = PyObject_HashNotImplemented",
+                    explanation=f"Cannot use {vt_type.__name__} as a dictionary key because it is not hashable.",
+                    hints=[
+                        f"Use a hashable type (int, str, tuple, etc.) instead of {vt_type.__name__}.",
+                        *graph_break_hints.USER_ERROR,
+                    ],
+                )
+
+            # Fallback to VT-level hashability check for types where the C-level
+            # slot doesn't tell the full story (e.g. user-defined __hash__ = None).
             if not is_hashable(vt):
                 raise_unhashable(vt)
             self.vt = vt
@@ -510,8 +529,7 @@ class ConstDictVariable(VariableTracker):
     def getitem_const_raise_exception_if_absent(
         self, tx: "InstructionTranslator", arg: VariableTracker
     ) -> VariableTracker:
-        # TODO(follow-up): check tp_hash — unhashable keys (e.g. list) should
-        # raise TypeError, not graph break via is_python_hashable/unimplemented.
+        # _HashableTracker checks tp_hash (C-level) then is_python_hashable (VT-level).
         key = ConstDictVariable._HashableTracker(arg)
         if key not in self.items:
             try:
@@ -527,8 +545,7 @@ class ConstDictVariable(VariableTracker):
     def getitem_const(
         self, tx: "InstructionTranslator", arg: VariableTracker
     ) -> VariableTracker:
-        # TODO(follow-up): check tp_hash — unhashable keys (e.g. list) should
-        # raise TypeError, not graph break via is_python_hashable/unimplemented.
+        # _HashableTracker checks tp_hash (C-level) then is_python_hashable (VT-level).
         key = ConstDictVariable._HashableTracker(arg)
         if key not in self.items:
             msg = f"Dictionary key {arg.value} not found during tracing"  # type: ignore[attr-defined]

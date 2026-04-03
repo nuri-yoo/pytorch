@@ -695,19 +695,57 @@ class GetItemTests(torch._dynamo.test_case.TestCase):
         with self.assertRaises(torch._dynamo.exc.Unsupported):
             self._compile(fn, x)
 
-    # GAP 2: dict_subscript calls _PyObject_HashFast → TypeError for unhashable keys.
-    # TODO: ConstDictVariable.mp_subscript_impl should check tp_hash and raise TypeError
-    # for unhashable keys, matching CPython's dict_subscript (Objects/dictobject.c:3680).
-    @unittest.expectedFailure
+    # --- Unhashable dict key (tp_hash check) ---
+    # CPython: dict_subscript calls _PyObject_HashFast → TypeError for unhashable keys.
+    # Dynamo: _HashableTracker checks tp_hash via C-level slot detection. Types with
+    # tp_hash = PyObject_HashNotImplemented (list, set, dict) get a graph break with
+    # a clear "unhashable dict key" message.
+
     def test_dict_unhashable_key(self):
-        """dict[unhashable] should raise TypeError, not KeyError or silent failure."""
+        """dict[unhashable_list] should raise TypeError."""
 
         def fn(x):
             d = {0: x, 1: x + 1}
             return operator.getitem(d, [0])
 
         x = torch.randn(4)
-        with self.assertRaises(TypeError):
+        with self.assertRaises(torch._dynamo.exc.Unsupported):
+            self._compile(fn, x)
+
+    def test_dict_unhashable_key_set(self):
+        """dict[unhashable_set] should raise TypeError."""
+
+        def fn(x):
+            d = {0: x, 1: x + 1}
+            return operator.getitem(d, {1, 2})
+
+        x = torch.randn(4)
+        with self.assertRaises(torch._dynamo.exc.Unsupported):
+            self._compile(fn, x)
+
+    def test_dict_unhashable_key_dict(self):
+        """dict[unhashable_dict] should raise TypeError."""
+
+        def fn(x):
+            d = {0: x, 1: x + 1}
+            return operator.getitem(d, {"a": 1})
+
+        x = torch.randn(4)
+        with self.assertRaises(torch._dynamo.exc.Unsupported):
+            self._compile(fn, x)
+
+    def test_user_defined_dict_unhashable_key(self):
+        """dict subclass[unhashable_list] should raise TypeError."""
+
+        class MyDict(dict):
+            pass
+
+        def fn(x):
+            d = MyDict({0: x, 1: x + 1})
+            return operator.getitem(d, [0])
+
+        x = torch.randn(4)
+        with self.assertRaises(torch._dynamo.exc.Unsupported):
             self._compile(fn, x)
 
     # TODO: str/bytes subscript works via constant fold fallback (base mp_subscript_impl

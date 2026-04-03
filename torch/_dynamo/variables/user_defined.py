@@ -3052,7 +3052,7 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
         key: VariableTracker,
     ) -> VariableTracker:
         # dict_subscript: https://github.com/python/cpython/blob/62a6e898e01/Objects/dictobject.c#L3673-L3706
-        # TODO(follow-up): add test for unhashable/invalid key type, Counter missing key
+        # Unhashable keys are caught by _HashableTracker's tp_hash check.
         method = self._maybe_get_baseclass_method("__getitem__")
         if method in self._dict_methods:
             try:

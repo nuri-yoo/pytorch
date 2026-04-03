@@ -312,6 +312,24 @@ class TestTypeSlots(TestCase):
                 f"{t.__name__} should have mp_subscript",
             )
 
+    def test_tp_hash_hashable_types(self):
+        """Hashable types have tp_hash (real implementation, not PyObject_HashNotImplemented)."""
+        for t in [int, bool, float, str, bytes, tuple, range, frozenset, type]:
+            _, _, _, type_slots = self._get_slot_info(t)
+            self.assertTrue(
+                has_slot(type_slots, PyTypeSlots.TP_HASH),
+                f"{t.__name__} should have tp_hash",
+            )
+
+    def test_tp_hash_unhashable_types(self):
+        """Unhashable types have tp_hash = PyObject_HashNotImplemented → TP_HASH is False."""
+        for t in [list, set, dict, bytearray]:
+            _, _, _, type_slots = self._get_slot_info(t)
+            self.assertFalse(
+                has_slot(type_slots, PyTypeSlots.TP_HASH),
+                f"{t.__name__} should NOT have tp_hash (unhashable)",
+            )
+
 
 if __name__ == "__main__":
     run_tests()
