@@ -9,7 +9,13 @@ Per-type richcompare_impl hooks live in their respective VT files.
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from torch._C._dynamo import get_type_slots, has_slot, PyMappingSlots, PySequenceSlots
+from torch._C._dynamo import (
+    get_type_slots,
+    has_slot,
+    PyMappingSlots,
+    PyNumberSlots,
+    PySequenceSlots,
+)
 
 from .. import graph_break_hints
 from ..exc import unimplemented
@@ -97,6 +103,24 @@ def type_implements_mp_length(obj_type: type) -> bool:
     return has_slot(map_slots, PyMappingSlots.MP_LENGTH)
 
 
+def type_implements_mp_subscript(obj_type: type) -> bool:
+    """Check whether obj_type has tp_as_mapping->mp_subscript."""
+    _, map_slots, _, _ = _get_cached_slots(obj_type)
+    return has_slot(map_slots, PyMappingSlots.MP_SUBSCRIPT)
+
+
+def type_implements_sq_item(obj_type: type) -> bool:
+    """Check whether obj_type has tp_as_sequence->sq_item."""
+    seq_slots, _, _, _ = _get_cached_slots(obj_type)
+    return has_slot(seq_slots, PySequenceSlots.SQ_ITEM)
+
+
+def type_implements_nb_index(obj_type: type) -> bool:
+    """CPython's _PyIndex_Check: tp_as_number->nb_index != NULL."""
+    _, _, num_slots, _ = _get_cached_slots(obj_type)
+    return has_slot(num_slots, PyNumberSlots.NB_INDEX)
+
+
 def maybe_get_python_type(obj: VariableTracker) -> type:
     try:
         return obj.python_type()
@@ -141,6 +165,13 @@ def generic_len(
     return vt_mapping_size(tx, obj)
 
 
+def _try_get_python_type(obj: VariableTracker) -> type | None:
+    try:
+        return obj.python_type()
+    except NotImplementedError:
+        return None
+
+
 def vt_getitem(
     tx: "InstructionTranslator",
     obj: VariableTracker,
@@ -156,11 +187,7 @@ def vt_getitem(
       3. PyType_Check(o)              (L183-203) — type[int] → GenericAlias/__class_getitem__
 
     Branch 1 is the common path (list, tuple, dict, range all have mp_subscript).
-    TODO(follow-up): use has_slot(map_slots, PyMappingSlots.MP_SUBSCRIPT) to gate
-    Branch 1 and has_slot(seq_slots, PySequenceSlots.SQ_ITEM) to gate Branch 2,
-    matching CPython's dispatch order.
-    TODO(follow-up): Branch 2 (sq_item) for C extension types that only have
-    tp_as_sequence (e.g. deque — Modules/_collectionsmodule.c:1888).
+    Branch 2 fires for types with only sq_item (e.g. deque).
     Branch 3 is handled by TypingVariable.mp_subscript_impl for typing module types
     and by BuiltinVariable for builtin types like list[int].
 
@@ -168,4 +195,26 @@ def vt_getitem(
     TODO(follow-up): str (unicode_subscript, Objects/unicodeobject.c:13809)
     TODO(follow-up): bytes (bytes_subscript, Objects/bytesobject.c)
     """
+    from ..exc import raise_observed_exception
+
+    obj_type = _try_get_python_type(obj)
+    if obj_type is not None:
+        # Branch 1: mp_subscript
+        if type_implements_mp_subscript(obj_type):
+            return obj.mp_subscript_impl(tx, key)
+        # Branch 2: sq_item (only if mp_subscript is absent)
+        # CPython: abstract.c L168-181 — _PyIndex_Check(key) → PyNumber_AsSsize_t → sq_item
+        if type_implements_sq_item(obj_type):
+            key_type = _try_get_python_type(key)
+            if key_type is not None and not type_implements_nb_index(key_type):
+                raise_observed_exception(
+                    TypeError,
+                    tx,
+                    args=[
+                        f"{obj_type.__name__} indices must be integers, not {key_type.__name__}"
+                    ],
+                )
+            key = key.nb_index_impl(tx)
+            return obj.sq_item_impl(tx, key)
+    # Fallback for unknown types or types without slots
     return obj.mp_subscript_impl(tx, key)

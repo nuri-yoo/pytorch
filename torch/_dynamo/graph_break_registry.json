@@ -1538,6 +1538,12 @@
   ],
   "GB1201": [
     {
+      "Gb_type": "unsupported __getitem__ (mp_subscript)",
+      "Context": "mp_subscript_impl {self} {key}",
+      "Explanation": "Dynamo does not know how to handle __getitem__ on {self}",
+      "Hints": []
+    },
+    {
       "Gb_type": "unsupported __getitem__",
       "Context": "mp_subscript_impl {self} {key}",
       "Explanation": "Dynamo does not know how to handle __getitem__ on {self}",
@@ -2105,6 +2111,14 @@
         "and passed as an argument.",
         "If the module is a class attribute, access it via self.module_name."
       ]
+    }
+  ],
+  "GB5904": [
+    {
+      "Gb_type": "unsupported __getitem__ (sq_item)",
+      "Context": "sq_item_impl {self} {key}",
+      "Explanation": "Dynamo does not know how to handle sq_item on {self}",
+      "Hints": []
     }
   ],
   "GB0163": [

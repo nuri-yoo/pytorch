@@ -635,12 +635,46 @@ class GetItemTests(torch._dynamo.test_case.TestCase):
     # See agent_space/cpython_getitem_gap_analysis.md for details.
     # ===================================================================
 
-    # GAP 1: deque has only sq_item (int index), no mp_subscript.
-    # CPython: deque[slice] → TypeError "sequence index must be integer, not 'slice'"
-    # Dynamo: DequeVariable inherits BaseListVariable.mp_subscript_impl which accepts slices.
-    # TODO: DequeVariable should override mp_subscript_impl to reject slices, matching
-    # CPython's deque which only has sq_item (Modules/_collectionsmodule.c:1888).
-    @unittest.expectedFailure
+    # --- DequeVariable (sq_item path) ---
+    # CPython's deque only has sq_item (Modules/_collectionsmodule.c:1888), not
+    # mp_subscript. vt_getitem dispatches to sq_item_impl for deque.
+
+    def test_deque_int_index(self):
+        def fn(x):
+            d = collections.deque([x, x + 1, x + 2])
+            return operator.getitem(d, 1)
+
+        x = torch.randn(4)
+        self.assertEqual(fn(x), self._compile(fn, x))
+
+    def test_deque_negative_index(self):
+        def fn(x):
+            d = collections.deque([x, x + 1, x + 2])
+            return operator.getitem(d, -1)
+
+        x = torch.randn(4)
+        self.assertEqual(fn(x), self._compile(fn, x))
+
+    def test_deque_bool_index(self):
+        def fn(x):
+            d = collections.deque([x, x + 1, x + 2])
+            return operator.getitem(d, True)
+
+        x = torch.randn(4)
+        self.assertEqual(fn(x), self._compile(fn, x))
+
+    def test_deque_index_via_index_dunder(self):
+        class Idx:
+            def __index__(self):
+                return 2
+
+        def fn(x):
+            d = collections.deque([x, x + 1, x + 2])
+            return operator.getitem(d, Idx())
+
+        x = torch.randn(4)
+        self.assertEqual(fn(x), self._compile(fn, x))
+
     def test_deque_slice_should_reject(self):
         """deque does not support slicing in CPython — only sq_item (int index)."""
 
@@ -649,20 +683,17 @@ class GetItemTests(torch._dynamo.test_case.TestCase):
             return operator.getitem(d, slice(0, 2))
 
         x = torch.randn(4)
-        with self.assertRaises(TypeError):
+        with self.assertRaises(torch._dynamo.exc.Unsupported):
             self._compile(fn, x)
 
-    # TODO: deque int index works but through the wrong dispatch path.
-    # CPython: PyObject_GetItem Branch 2 → _PyIndex_Check(key) → PyNumber_AsSsize_t → sq_item.
-    # Dynamo: inherited BaseListVariable.mp_subscript_impl (Branch 1 path).
-    # Result is correct, dispatch path diverges. Fix when sq_item branch is implemented.
-    def test_deque_int_index(self):
+    def test_deque_invalid_index_type(self):
         def fn(x):
             d = collections.deque([x, x + 1, x + 2])
-            return operator.getitem(d, 1)
+            return operator.getitem(d, "a")
 
         x = torch.randn(4)
-        self.assertEqual(fn(x), self._compile(fn, x))
+        with self.assertRaises(torch._dynamo.exc.Unsupported):
+            self._compile(fn, x)
 
     # GAP 2: dict_subscript calls _PyObject_HashFast → TypeError for unhashable keys.
     # TODO: ConstDictVariable.mp_subscript_impl should check tp_hash and raise TypeError
@@ -741,7 +772,6 @@ class GetItemTests(torch._dynamo.test_case.TestCase):
 
         x = torch.randn(4)
         self.assertEqual(fn(x), self._compile(fn, x))
-
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
