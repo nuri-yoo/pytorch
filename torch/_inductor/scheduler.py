@@ -105,6 +105,38 @@ PartitionType: TypeAlias = list["BaseSchedulerNode"]
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
 
+_autotune_fusion_stats: dict[str, int | float] = {}
+_autotune_fusion_stats_file: str | None = None
+_autotune_fusion_attempted_nodes: set[str] = set()
+
+
+def _reset_autotune_fusion_stats() -> None:
+    global _autotune_fusion_stats_file
+    _autotune_fusion_stats.clear()
+    _autotune_fusion_stats.update(
+        {
+            "autotune_fusion_invocations": 0,
+            "fusion_wins": 0,
+            "extern_wins": 0,
+            "configs_compiled": 0,
+            "configs_failed": 0,
+            "unfused_slower_than_fused": 0,
+            "unfused_faster_than_fused": 0,
+            "fallback_to_unfused": 0,
+            "fallback_extern_wins": 0,
+            "fallback_triton_wins": 0,
+        }
+    )
+    if _autotune_fusion_stats_file is None:
+        import datetime
+
+        stats_dir = "/data/users/warrdeng/onboarding/max_autotune/benchmark_results"
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _autotune_fusion_stats_file = (
+            f"{stats_dir}/autotune_fusion_stats_{timestamp}.jsonl"
+        )
+    _autotune_fusion_attempted_nodes.clear()
+
 
 @dataclasses.dataclass
 class FusionResult:
@@ -3088,6 +3120,8 @@ class Scheduler:
     def _init(self, nodes: list[ir.Operation]) -> None:
         super().__init__()
         V.graph.scheduler = self
+        if config.autotune_at_fusion_time:
+            _reset_autotune_fusion_stats()
         self.backends: dict[torch.device, BaseScheduling] = {}
         self.post_grad_graph_id = next(_post_grad_graph_counter)
         self._graph_partition_counter = itertools.count()
@@ -4169,6 +4203,9 @@ class Scheduler:
         """
         from torch._inductor.codegen.simd import CantSplit
 
+        _autotune_fusion_stats["autotune_fusion_invocations"] += 1
+        _autotune_fusion_attempted_nodes.add(multi_node.get_name())
+
         # Benchmark extern callers (cuBLAS) directly via bmreq,
         # bypassing the autotuning pipeline.
         extern_time = float("inf")
@@ -4199,7 +4236,9 @@ class Scheduler:
                             *self.compile_kernel(node_list_fused),
                         )
                     )
+                    _autotune_fusion_stats["configs_compiled"] += 1
                 except CantSplit:
+                    _autotune_fusion_stats["configs_failed"] += 1
                     continue
 
         if not future_choices:
@@ -4223,14 +4262,20 @@ class Scheduler:
                 assert hasattr(ms_fused_choice, "bmreq")
                 unfused_triton_time = ms_fused_choice.bmreq.benchmark()
                 baseline_time = min(extern_time, unfused_triton_time)
+                if min_ms_fused < unfused_triton_time + ms2:
+                    _autotune_fusion_stats["unfused_slower_than_fused"] += 1
+                else:
+                    _autotune_fusion_stats["unfused_faster_than_fused"] += 1
 
             log_fusion(min_ms_fused, baseline_time, ms2)
 
             if min_ms_fused < (baseline_time + ms2) and ms_fused_choice is not None:
+                _autotune_fusion_stats["fusion_wins"] += 1
                 # pyrefly: ignore [missing-attribute]
                 multi_node.finalize_as_triton_caller(ms_fused_choice)
                 multi_node._choice_timings[None] = new_timings
                 return True
+            _autotune_fusion_stats["extern_wins"] += 1
             return False
 
         return FusionResult.from_callable(
@@ -4295,6 +4340,12 @@ class Scheduler:
                 node.node, ir.MultiTemplateBuffer
             ):
                 multi_node = node.node
+
+                if config.autotune_at_fusion_time:
+                    was_attempted = multi_node.get_name() in _autotune_fusion_attempted_nodes
+                else:
+                    was_attempted = False
+
                 if not config.test_configs.force_extern_kernel_in_multi_template:
                     min_node_unfused, _ = multi_node.get_min_choice()
                 else:
@@ -4334,6 +4385,9 @@ class Scheduler:
                     min_node_unfused,
                     torch._inductor.ir.TritonTemplateCallerBase,
                 ):
+                    if was_attempted:
+                        _autotune_fusion_stats["fallback_to_unfused"] += 1
+                        _autotune_fusion_stats["fallback_triton_wins"] += 1
                     # pyrefly: ignore [unbound-name]
                     if config.multi_kernel_hints:
                         callers: dict[int | None, TritonTemplateCallerBase] = {}
@@ -4356,6 +4410,9 @@ class Scheduler:
                     continue
 
                 with ir.IRNode.current_origins(multi_node.origins):
+                    if was_attempted:
+                        _autotune_fusion_stats["fallback_to_unfused"] += 1
+                        _autotune_fusion_stats["fallback_extern_wins"] += 1
                     out_tensorbox = min_node_unfused.output_node()
                 out_storage = out_tensorbox.data  # type: ignore[union-attr]
                 assert isinstance(out_storage, ir.StorageBox)
@@ -4367,6 +4424,15 @@ class Scheduler:
 
                 out_buffer.layout = multi_node.layout
                 self._replace_node(out_buffer, multi_node, i, node)
+
+        if config.autotune_at_fusion_time and _autotune_fusion_stats.get(
+            "autotune_fusion_invocations", 0
+        ):
+            import json
+
+            assert _autotune_fusion_stats_file is not None
+            with open(_autotune_fusion_stats_file, "a") as f:
+                f.write(json.dumps(_autotune_fusion_stats) + "\n")
 
     def _replace_node(
         self,
