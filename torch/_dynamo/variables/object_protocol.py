@@ -2,13 +2,20 @@
 Dynamo implementations of CPython's PyObject_* default slot algorithms.
 
 Analogous to CPython's Objects/object.c, this module holds the general
-comparison dispatch machinery that is independent of any specific type.
-Per-type richcompare_impl hooks live in their respective VT files.
+dispatch machinery that is independent of any specific type.
+Per-type hook implementations (bool_impl, richcompare_impl, etc.)
+live in their respective VT files.
 """
+
+from typing import TYPE_CHECKING
 
 from ..utils import istype
 from .base import NO_SUCH_SUBOBJ, VariableTracker
 from .constant import CONSTANT_VARIABLE_FALSE, CONSTANT_VARIABLE_TRUE
+
+
+if TYPE_CHECKING:
+    from ..symbolic_convert import InstructionTranslator
 
 
 def vt_identity_compare(
@@ -61,5 +68,47 @@ def vt_identity_compare(
         and left.exc_type is not right.exc_type  # type: ignore[attr-defined]
     ):
         return CONSTANT_VARIABLE_FALSE
+
+    return None
+
+
+def generic_bool(tx: "InstructionTranslator", obj: VariableTracker) -> VariableTracker:
+    """Mirrors PyObject_IsTrue.
+
+    https://github.com/python/cpython/blob/c09ccd9c429/Objects/object.c#L2135-L2158
+
+    Resolution order: constants → nb_bool → mp_length/sq_length → truthy.
+    """
+    from .constant import ConstantVariable
+
+    if obj.is_python_constant():
+        return ConstantVariable.create(bool(obj.as_python_constant()))
+
+    result = obj.bool_impl(tx)
+    if result is not None:
+        return result
+
+    result = _bool_from_length(tx, obj)
+    if result is not None:
+        return result
+
+    return CONSTANT_VARIABLE_TRUE
+
+
+def _bool_from_length(
+    tx: "InstructionTranslator", obj: VariableTracker
+) -> VariableTracker | None:
+    """mp_length / sq_length fallback in PyObject_IsTrue."""
+    from .constant import ConstantVariable
+    from .dicts import ConstDictVariable
+    from .lists import BaseListVariable
+
+    if isinstance(obj, BaseListVariable):
+        return ConstantVariable.create(len(obj.items) > 0)
+    if isinstance(obj, ConstDictVariable):
+        return ConstantVariable.create(len(obj.items) > 0)
+
+    if obj.has_unpack_var_sequence(tx):
+        return ConstantVariable.create(len(obj.unpack_var_sequence(tx)) > 0)
 
     return None

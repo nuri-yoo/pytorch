@@ -400,6 +400,14 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         except NotImplementedError:
             return False
 
+    def bool_impl(self, tx: "InstructionTranslator") -> "VariableTracker | None":
+        # Mirrors CPython's tp_as_number->nb_bool slot.
+        # https://github.com/python/cpython/blob/c09ccd9c429/Objects/object.c#L2135-L2158
+        #
+        # Returns None when the type has no nb_bool, causing generic_bool to
+        # fall through to length check, then truthy default.
+        return None
+
     def is_constant_match(self, *values: Any) -> bool:
         """
         Check if this variable is a python constant matching one of the given values.
