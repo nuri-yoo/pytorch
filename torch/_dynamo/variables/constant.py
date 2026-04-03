@@ -149,6 +149,9 @@ its type to `common_constant_types`.
     def getitem_const(
         self, tx: "InstructionTranslator", arg: VariableTracker
     ) -> VariableTracker:
+        # TODO(follow-up): str/bytes subscript works here via constant fold but
+        # bypasses CPython's type checking (unicode_subscript, bytes_subscript).
+        # Should add dedicated mp_subscript_impl for ConstantVariable str/bytes.
         return ConstantVariable.create(
             self.value[arg.as_python_constant()],
         )

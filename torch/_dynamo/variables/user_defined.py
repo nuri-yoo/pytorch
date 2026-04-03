@@ -1549,6 +1549,19 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         }
         return fns
 
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # PyObject_GetItem: https://github.com/python/cpython/blob/62a6e898e01/Objects/abstract.c#L155-L206
+        method = self._maybe_get_baseclass_method("__getitem__")
+        if method is not None:
+            return self.resolve_type_attr(
+                tx, "__getitem__", method, self.source
+            ).call_function(tx, [key], {})
+        return super().mp_subscript_impl(tx, key)
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -3033,6 +3046,26 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
             self._dict_vt = dict_vt
         self._dict_methods = dict_methods
 
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # dict_subscript: https://github.com/python/cpython/blob/62a6e898e01/Objects/dictobject.c#L3673-L3706
+        # TODO(follow-up): add test for unhashable/invalid key type, Counter missing key
+        method = self._maybe_get_baseclass_method("__getitem__")
+        if method in self._dict_methods:
+            try:
+                return self._dict_vt.mp_subscript_impl(tx, key)
+            except ObservedKeyError:
+                if issubclass(
+                    self.python_type(), dict
+                ) and self._maybe_get_baseclass_method("__missing__"):
+                    return self.call_method(tx, "__missing__", [key], {})
+                else:
+                    raise
+        return super().mp_subscript_impl(tx, key)
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -3042,20 +3075,11 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
     ) -> VariableTracker:
         method = self._maybe_get_baseclass_method(name)
         if method in self._dict_methods:
-            # Dict subclasses can override __missing__ to provide fallback
-            # behavior instead of raising a KeyError. This is used, for example,
-            # by collections.Counter.
-            try:
+            # __getitem__ is handled by mp_subscript_impl (which has __missing__
+            # fallback); skip _dict_vt delegation so self.mp_subscript_impl is
+            # called, not ConstDictVariable.mp_subscript_impl.
+            if name != "__getitem__":
                 return self._dict_vt.call_method(tx, name, args, kwargs)
-            except ObservedKeyError:
-                if (
-                    name == "__getitem__"
-                    and issubclass(self.python_type(), dict)
-                    and self._maybe_get_baseclass_method("__missing__")
-                ):
-                    return self.call_method(tx, "__missing__", args, kwargs)
-                else:
-                    raise
         return super().call_method(tx, name, args, kwargs)
 
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
@@ -3222,6 +3246,19 @@ class UserDefinedListVariable(UserDefinedObjectVariable):
         else:
             self._list_vt = list_vt
 
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # Delegates to list's list_subscript via _list_vt.
+        # TODO(follow-up): add tests for negative index, slice
+        assert self._list_vt is not None
+        method = self._maybe_get_baseclass_method("__getitem__")
+        if method in list_methods:
+            return self._list_vt.mp_subscript_impl(tx, key)
+        return super().mp_subscript_impl(tx, key)
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -3303,6 +3340,19 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
             _, (idx, _) = type_attr.__reduce__()
             return self._tuple_vt.items[idx]  # type: ignore[union-attr]
         return super().resolve_data_descriptor(tx, name, type_attr, source)
+
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # Delegates to tuple's tuple_subscript via _tuple_vt.
+        # TODO(follow-up): add tests for negative index, slice
+        assert self._tuple_vt is not None
+        method = self._maybe_get_baseclass_method("__getitem__")
+        if method in tuple_methods:
+            return self._tuple_vt.mp_subscript_impl(tx, key)
+        return super().mp_subscript_impl(tx, key)
 
     def call_method(
         self,

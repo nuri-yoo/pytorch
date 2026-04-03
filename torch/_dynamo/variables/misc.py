@@ -51,6 +51,7 @@ from ..guards import GuardBuilder, install_guard
 from ..mutation_guard import unpatched_nn_module_init
 from ..source import (
     AttrSource,
+    DictGetItemSource,
     GenericAttrSource,
     GetItemSource,
     TypeMROSource,
@@ -1350,6 +1351,120 @@ class GetAttrVariable(VariableTracker):
     ) -> VariableTracker:
         return self.obj.call_method(tx, self.name, list(args), kwargs)
 
+    def _getattr_dict_lookup(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker | None:
+        if (
+            self.name == "__dict__"
+            and key.is_python_constant()
+            and isinstance(
+                self.obj,
+                (
+                    variables.NNModuleVariable,
+                    variables.UserDefinedClassVariable,
+                ),
+            )
+        ):
+            obj = self.obj
+            k = key.as_python_constant()
+            if obj.has_key_in_generic_dict(tx, k):  # type: ignore[union-attr]
+                if tx.output.side_effects.has_pending_mutation_of_attr(obj, k):
+                    return tx.output.side_effects.load_attr(obj, k)
+
+                # For instance dicts, read directly from __dict__
+                if isinstance(obj.value.__dict__, dict):
+                    raw_value = obj.value.__dict__[k]
+                    raw_source = (
+                        DictGetItemSource(AttrSource(obj.source, "__dict__"), k)
+                        if obj.source
+                        else None
+                    )
+                    return VariableTracker.build(tx, raw_value, raw_source)
+
+                return obj.var_getattr(tx, k)
+        return None
+
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # Synthetic __dict__ access — not a direct CPython slot.
+        # TODO(follow-up): add tests for invalid key type, missing key
+        result = self._getattr_dict_lookup(tx, key)
+        if result is not None:
+            return result
+        return super().mp_subscript_impl(tx, key)
+
+    def call_method(
+        self,
+        tx: "InstructionTranslator",
+        name: str,
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        if (
+            name == "get"
+            and self.name == "__dict__"
+            and not kwargs
+            and args[0].is_python_constant()
+            and isinstance(
+                self.obj,
+                (
+                    variables.NNModuleVariable,
+                    variables.UserDefinedClassVariable,
+                ),
+            )
+        ):
+            result = self._getattr_dict_lookup(tx, args[0])
+            if result is not None:
+                return result
+
+            # Return the default value for get
+            if len(args) == 2:
+                return args[1]
+            else:
+                return variables.CONSTANT_VARIABLE_NONE
+
+        elif (
+            name == "__contains__"
+            and self.name == "__dict__"
+            and len(args) == 1
+            and args[0].is_python_constant()
+            and not kwargs
+            and isinstance(
+                self.obj,
+                (
+                    variables.NNModuleVariable,
+                    variables.UserDefinedClassVariable,
+                ),
+            )
+        ):
+            obj = self.obj
+            key = args[0].as_python_constant()
+            if obj.has_key_in_generic_dict(tx, key):  # type: ignore[union-attr]
+                return variables.CONSTANT_VARIABLE_TRUE
+            else:
+                return variables.CONSTANT_VARIABLE_FALSE
+
+        elif name == "__setitem__" and self.name == "__dict__" and not kwargs:
+            if isinstance(self.obj, variables.NNModuleVariable):
+                # This matches how `setattr` is handled for NNModuleVariable
+                self.obj.convert_to_unspecialized(tx)
+
+        return super().call_method(tx, name, args, kwargs)
+
+    def get_forwarded_dict(self, tx: "InstructionTranslator") -> VariableTracker:
+        assert (
+            self.name == "__dict__"
+            and isinstance(self.obj, variables.UserDefinedClassVariable)
+            and not tx.output.side_effects.has_pending_mutation(self.obj)
+        )
+        self.obj.ban_mutation = True
+        return VariableTracker.build(tx, self.obj.value.__dict__, self.source)
+
 
 class MethodWrapperVariable(VariableTracker):
     def __init__(self, method_wrapper: types.MethodWrapperType, **kwargs: Any) -> None:
@@ -1568,6 +1683,16 @@ class TypingVariable(VariableTracker):
         super().__init__(**kwargs)
         self.value = value
 
+    def mp_subscript_impl(
+        self,
+        tx: "InstructionTranslator",
+        key: VariableTracker,
+    ) -> VariableTracker:
+        # e.g., List[int] → typing.List[int]
+        # TODO(follow-up): add test for invalid subscript type
+        new_typing = self.value[key.as_python_constant()]
+        return TypingVariable(new_typing)
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -1575,11 +1700,7 @@ class TypingVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        # Create a new typing variable, e.g., `List[int]`
-        if name == "__getitem__" and len(args) == 1:
-            new_typing = self.value[args[0].as_python_constant()]
-            return TypingVariable(new_typing)
-        elif name == "__eq__":
+        if name == "__eq__":
             if len(args) == 1 and not kwargs:
                 result = istype(args[0], TypingVariable) and self.value == args[0].value
                 return variables.ConstantVariable.create(result)
