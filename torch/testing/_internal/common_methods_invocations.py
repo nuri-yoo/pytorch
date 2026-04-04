@@ -12734,6 +12734,8 @@ op_db: list[OpInfo] = [
                             dtypes=(torch.float64,), device_type='xpu'),
                DecorateInfo(unittest.expectedFailure, 'TestBwdGradients', 'test_inplace_grad',
                             dtypes=(torch.float64,), device_type='xpu'),
+               DecorateInfo(unittest.expectedFailure, 'TestBwdGradients', 'test_inplace_gradgrad',
+                            dtypes=(torch.float64,), device_type='xpu'),
                # https://github.com/intel/torch-xpu-ops/issues/1893
                DecorateInfo(unittest.skip('Skipped!'), 'TestMathBits', 'test_neg_view',
                             device_type='xpu', dtypes=(torch.float64,)),),
@@ -26906,6 +26908,7 @@ python_ref_db = [
             # The dtyeps of _refs.stft is not aligned to stft
             # # https://github.com/intel/torch-xpu-ops/issues/3238
             DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='xpu'),
+            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_python_ref_meta', device_type='xpu'),
         ],
     ),
     PythonRefInfo(
