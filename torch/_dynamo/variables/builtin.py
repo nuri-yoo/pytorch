@@ -312,7 +312,7 @@ def populate_builtin_to_tensor_fn_map() -> None:
 class BaseBuiltinVariable(VariableTracker):
     """
     Common base class for all builtin variable trackers (BuiltinVariable,
-    DictBuiltinVariable, IterBuiltinVariable, and future specialized builtins).
+    DictBuiltinVariable, and future specialized builtins).
 
     Provides shared implementations for guard installation, hasattr tracing,
     and Python-level hashability/equality.
@@ -936,7 +936,11 @@ class BuiltinVariable(BaseBuiltinVariable):
 
     # Builtins that have been promoted to their own VT classes. Creating a
     # BuiltinVariable for these is a bug; use the specialized class instead.
-    MUST_USE_SPECIALIZED: frozenset[Any] = frozenset({dict, iter})
+    MUST_USE_SPECIALIZED: frozenset[Any] = frozenset(
+        {
+            dict,
+        }
+    )
 
     def __init__(self, fn: Any, **kwargs: Any) -> None:
         assert fn not in self.MUST_USE_SPECIALIZED, (
@@ -1536,6 +1540,13 @@ class BuiltinVariable(BaseBuiltinVariable):
             # object.__init__ is a no-op
             return variables.CONSTANT_VARIABLE_NONE
 
+        if name == "__iter__" and len(args) == 1 and not kwargs:
+            # type.__iter__(instance) → iter(instance)
+            # e.g., tuple.__iter__(my_tuple) → iter(my_tuple)
+            from .object_protocol import generic_getiter
+
+            return generic_getiter(tx, args[0])
+
         if self.fn is set:
             resolved_fn = getattr(self.fn, name)
             if resolved_fn in set_methods:
@@ -2056,6 +2067,22 @@ class BuiltinVariable(BaseBuiltinVariable):
         else:
             return self._call_iter_tuple_list(tx, obj, *args, **kwargs)
 
+    def call_iter(
+        self,
+        tx: "InstructionTranslator",
+        obj: VariableTracker,
+        *args: VariableTracker,
+        **kwargs: VariableTracker,
+    ) -> VariableTracker:
+        from .object_protocol import generic_getiter
+
+        if len(args) == 0:
+            return generic_getiter(tx, obj)
+        else:
+            return variables.UserFunctionVariable(
+                polyfills.builtins.callable_iterator
+            ).call_function(tx, [obj, *args], kwargs)
+
     call_tuple = _call_tuple_list
     call_list = _call_tuple_list
 
@@ -2143,7 +2170,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         elif isinstance(arg, variables.UserDefinedObjectVariable) and isinstance(
             arg.value, KeysView
         ):
-            iter_fn = arg.var_getattr(tx, "__iter__")
+            from .object_protocol import generic_getiter
+
+            iter_fn = generic_getiter(tx, arg)
             if isinstance(iter_fn, variables.UserMethodVariable):
                 out = tx.inline_user_function_return(iter_fn, args, kwargs)
                 if isinstance(out, SetVariable):
@@ -3354,72 +3383,6 @@ class DictBuiltinVariable(BaseBuiltinVariable):
                 "Ensure all keys are hashable.",
             ],
         )
-
-
-class IterBuiltinVariable(BaseBuiltinVariable):
-    """Variable tracker for the `iter` builtin."""
-
-    def __init__(self, value: Any = iter, **kwargs: Any) -> None:
-        assert value is iter
-        super().__init__(**kwargs)
-
-    def __repr__(self) -> str:
-        return "IterBuiltinVariable()"
-
-    def as_python_constant(self) -> Any:
-        return iter
-
-    def reconstruct(self, codegen: "PyCodegen") -> None:
-        assert "iter" not in codegen.tx.f_globals, "shadowed global"
-        codegen.append_output(codegen.create_load_global("iter", add=True))
-
-    def call_function(
-        self,
-        tx: "InstructionTranslator",
-        args: Sequence[VariableTracker],
-        kwargs: dict[str, VariableTracker],
-    ) -> VariableTracker:
-        if not args:
-            unimplemented(
-                gb_type="iter() with no arguments",
-                context="iter()",
-                explanation="iter() requires at least one argument",
-                hints=[*graph_break_hints.USER_ERROR],
-            )
-        obj, *rest = args
-
-        # Fast path: for known iterable VT types, call __iter__ directly
-        # instead of going through the polyfill, saving tracing overhead.
-        if (
-            not rest
-            and not kwargs
-            and isinstance(
-                obj,
-                (
-                    variables.ListVariable,
-                    variables.RangeVariable,
-                    variables.IteratorVariable,
-                    variables.ConstDictVariable,
-                    variables.NNModuleVariable,
-                    variables.TensorVariable,
-                    variables.TupleVariable,
-                    variables.UserDefinedClassVariable,
-                    DictViewVariable,
-                ),
-            )
-        ):
-            return obj.call_method(tx, "__iter__", [], {})
-
-        # General case: inline the polyfill which handles __iter__ and __getitem__
-        ret = variables.UserFunctionVariable(
-            polyfills.builtins.iter_  # type: ignore[arg-type]
-        ).call_function(tx, [obj, *rest], {})
-
-        if rest:
-            # iter(obj, sentinel) returns a callable iterator; wrap it so
-            # Dynamo knows to forward __next__ calls to the returned object.
-            ret = variables.ObjectIteratorVariable(ret)
-        return ret
 
 
 @contextlib.contextmanager

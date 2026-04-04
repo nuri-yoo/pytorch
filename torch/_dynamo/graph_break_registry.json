@@ -2499,6 +2499,17 @@
       ]
     }
   ],
+  "GB9389": [
+    {
+      "Gb_type": "tp_iter not implemented",
+      "Context": "iter({self})",
+      "Explanation": "Dynamo does not know how to iterate over {self.python_type_name()}",
+      "Hints": [
+        "Avoid calling `iter({self.python_type_name()})` in your code.",
+        "Please report an issue to PyTorch."
+      ]
+    }
+  ],
   "GB0200": [
     {
       "Gb_type": "missing BUILD_SET handler",

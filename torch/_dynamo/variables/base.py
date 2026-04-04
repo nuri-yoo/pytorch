@@ -532,6 +532,21 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             ],
         )
 
+    def tp_iter(self, tx: "InstructionTranslator") -> "VariableTracker":
+        """
+        Implements PyObject_GetIter semantics (tp_iter slot).
+        Subclasses override this to support iteration.
+        """
+        unimplemented(
+            gb_type="tp_iter not implemented",
+            context=f"iter({self})",
+            explanation=f"Dynamo does not know how to iterate over {self.python_type_name()}",
+            hints=[
+                f"Avoid calling `iter({self.python_type_name()})` in your code.",
+                "Please report an issue to PyTorch.",
+            ],
+        )
+
     def call_function(
         self,
         tx: Any,
@@ -575,6 +590,10 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             from .object_protocol import generic_len
 
             return generic_len(tx, self)
+        elif name == "__iter__" and not args and not kwargs:
+            from .object_protocol import generic_getiter
+
+            return generic_getiter(tx, self)
         elif (
             name == "__getattr__"
             and len(args) == 1

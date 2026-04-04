@@ -555,6 +555,22 @@ class UserDefinedClassVariable(UserDefinedVariable):
     def mp_length(self, tx: "InstructionTranslator") -> VariableTracker:
         return self.len_impl(tx)
 
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        m = self._maybe_get_baseclass_method("__iter__")
+        if m:
+            source = self.source and AttrSource(self.source, "__iter__")
+            return variables.UserMethodVariable(
+                m, self, source_fn=source
+            ).call_function(tx, [], {})
+        try:
+            items = self.unpack_var_sequence(tx)
+            return variables.ListIteratorVariable(
+                items, mutation_type=ValueMutationNew()
+            )
+        except NotImplementedError:
+            pass
+        return super().tp_iter(tx)
+
     def _call_cross_entropy_loss(
         self,
         tx: "InstructionTranslator",
@@ -1511,6 +1527,16 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             args,
             kwargs,
         )
+
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        iter_fn = self._maybe_get_baseclass_method("__iter__")
+        if iter_fn:
+            return variables.UserMethodVariable(
+                iter_fn,
+                self,
+                source=self.source and AttrSource(self.source, "__iter__"),
+            ).call_function(tx, [], {})
+        return super().tp_iter(tx)
 
     @staticmethod
     @functools.cache
@@ -3038,6 +3064,9 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
                     raise
         return super().call_method(tx, name, args, kwargs)
 
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        return self._dict_vt.tp_iter(tx)
+
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         if type(self.value).__iter__ in (  # type: ignore[attr-defined]
             dict.__iter__,
@@ -3134,6 +3163,9 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
     def as_python_constant(self) -> object:
         return self._set_vt.as_python_constant()
 
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        return self._set_vt.tp_iter(tx)
+
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         if inspect.getattr_static(self.value, "__iter__") in (
             set.__iter__,
@@ -3215,11 +3247,16 @@ class UserDefinedListVariable(UserDefinedObjectVariable):
             return self._list_vt.call_method(tx, name, args, kwargs)
         return super().call_method(tx, name, args, kwargs)
 
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        assert self._list_vt is not None
+        return self._list_vt.tp_iter(tx)
+
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         assert self._list_vt is not None
         if type(self.value).__iter__ is list.__iter__:  # type: ignore[attr-defined]
             return self._list_vt.unpack_var_sequence(tx)
         raise NotImplementedError
+        # return super().unpack_var_sequence(tx)
 
     def is_underlying_vt_modified(self, side_effects: "SideEffects") -> bool:
         return side_effects.is_modified(self._list_vt)
@@ -3304,6 +3341,10 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
         if method in tuple_methods:
             return self._tuple_vt.call_method(tx, name, args, kwargs)
         return super().call_method(tx, name, args, kwargs)
+
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        assert self._tuple_vt is not None
+        return self._tuple_vt.tp_iter(tx)
 
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         assert self._tuple_vt is not None

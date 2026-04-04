@@ -600,6 +600,14 @@ class ConstDictVariable(VariableTracker):
             else:
                 self.install_dict_keys_match_guard()
 
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        from .iter import DictIterator
+
+        self.install_dict_keys_match_guard()
+        if self.source and not is_constant_source(self.source):
+            tx.output.guard_on_key_order.add(self.source)
+        return DictIterator(self.items.keys())
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -956,14 +964,6 @@ class ConstDictVariable(VariableTracker):
         elif name == "__ior__":
             self.call_method(tx, "update", args, kwargs)
             return self
-        elif name == "__iter__":
-            from .lists import ListIteratorVariable
-
-            if self.source and not is_constant_source(self.source):
-                tx.output.guard_on_key_order.add(self.source)
-            return ListIteratorVariable(
-                self.unpack_var_sequence(tx), mutation_type=ValueMutationNew()
-            )
         else:
             return super().call_method(tx, name, args, kwargs)
 
@@ -1085,6 +1085,9 @@ class MappingProxyVariable(VariableTracker):
                 ],
             )
         return self.dv_dict.call_method(tx, name, args, kwargs)
+
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        return self.dv_dict.tp_iter(tx)
 
     def mp_length(self, tx: "InstructionTranslator") -> VariableTracker:
         return self.dv_dict.mp_length(tx)
@@ -1885,6 +1888,13 @@ class DictViewVariable(VariableTracker):
             return CONSTANT_VARIABLE_TRUE
         return CONSTANT_VARIABLE_FALSE
 
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        from .lists import ListIteratorVariable
+
+        return ListIteratorVariable(
+            self.view_items_vt, mutation_type=ValueMutationNew()
+        )
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -1892,12 +1902,8 @@ class DictViewVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        if name == "__iter__":
-            from .lists import ListIteratorVariable
-
-            return ListIteratorVariable(
-                self.view_items_vt, mutation_type=ValueMutationNew()
-            )
+        if name == "__len__":
+            return self.dv_dict.call_method(tx, name, args, kwargs)
         elif name == "__repr__":
             return VariableTracker.build(tx, self.debug_repr())
         return super().call_method(tx, name, args, kwargs)
@@ -2028,6 +2034,13 @@ class DictItemsVariable(DictViewVariable):
                 items.append(f"({key_str}, {val_str})")
             return "dict_items([" + ",".join(items) + "])"
 
+    def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
+        from .lists import ListIteratorVariable
+
+        return ListIteratorVariable(
+            self.view_items_vt, mutation_type=ValueMutationNew()
+        )
+
     def call_method(
         self,
         tx: "InstructionTranslator",
@@ -2056,12 +2069,6 @@ class DictItemsVariable(DictViewVariable):
                     len(self.set_items ^ args[0].set_items) == 0,
                 )
             return CONSTANT_VARIABLE_FALSE
-        elif name == "__iter__":
-            from .lists import ListIteratorVariable
-
-            return ListIteratorVariable(
-                self.view_items_vt, mutation_type=ValueMutationNew()
-            )
         elif name in (
             "__and__",
             "__iand__",

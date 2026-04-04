@@ -128,16 +128,14 @@ from user code:
                 zip(range(5), range(10))
             ),
             """\
-Unsupported method call
-  Explanation: Dynamo does not know how to trace method `__iter__` of class `zip`
-  Hint: Avoid calling `zip.__iter__` in your code.
-  Hint: Please report an issue to PyTorch.
-  Hint: Dynamo does not fully support tracing builtin iterators (e.g. `map`, `zip`, `enumerate`) passed in from uncompiled to compiled regions (e.g. `torch.compile(fn)(enumerate(...))`). This can happen unintentionally if a previous graph break happens with a builtin iterator in the local scope.
-  Hint: List/dict comprehensions in Python <= 3.11 result in implicit function calls, which Dynamo cannot trace as a top level frame. Possible workarounds are (1) use a loop instead of a comprehension, (2) fix any graph breaks in the function above the comprehension, (3) wrap the comprehension in a function, or (4) use Python 3.12+.
+can't handle functions not implemented in python
+  Explanation: Dynamo can only handle functions defined in python
+  Hint: Move usage of this function out of `torch.compile` region
+  Hint: Avoid using `tensor.is_inference()` and `torch.is_inference_mode_enabled()` in your compile code. This is primarily used in conjunction with `torch.inference_mode`. Consider using `torch.no_grad` instead because `torch.no_grad` leads to same improvements as `inference_mode` when `torch.compile` is used.
 
-  Developer debug context: call_method UserDefinedObjectVariable(zip) __iter__ [] {}
+  Developer debug context: <slot wrapper '__iter__' of 'zip' objects>
 
- For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0156.html
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0177.html
 
 from user code:
    File "test_error_messages.py", line N, in fn
@@ -156,17 +154,14 @@ from user code:
             Unsupported,
             lambda: torch.compile(fn, backend="eager", fullgraph=True)(x, dct.items()),
             """\
-Unsupported method call
-  Explanation: Dynamo does not know how to trace method `__iter__` of class `dict_items`
-  Hint: Avoid calling `dict_items.__iter__` in your code.
-  Hint: Please report an issue to PyTorch.
-  Hint: Consider moving the creation of dict view object (e.g. `dict.keys()`, `dict.items()`,) to the compiled region, instead of passing it as an input to the compiled region.
-  Hint: Dynamo does not fully support tracing builtin iterators (e.g. `map`, `zip`, `enumerate`) passed in from uncompiled to compiled regions (e.g. `torch.compile(fn)(enumerate(...))`). This can happen unintentionally if a previous graph break happens with a builtin iterator in the local scope.
-  Hint: List/dict comprehensions in Python <= 3.11 result in implicit function calls, which Dynamo cannot trace as a top level frame. Possible workarounds are (1) use a loop instead of a comprehension, (2) fix any graph breaks in the function above the comprehension, (3) wrap the comprehension in a function, or (4) use Python 3.12+.
+can't handle functions not implemented in python
+  Explanation: Dynamo can only handle functions defined in python
+  Hint: Move usage of this function out of `torch.compile` region
+  Hint: Avoid using `tensor.is_inference()` and `torch.is_inference_mode_enabled()` in your compile code. This is primarily used in conjunction with `torch.inference_mode`. Consider using `torch.no_grad` instead because `torch.no_grad` leads to same improvements as `inference_mode` when `torch.compile` is used.
 
-  Developer debug context: call_method UserDefinedObjectVariable(dict_items) __iter__ [] {}
+  Developer debug context: <slot wrapper '__iter__' of 'dict_items' objects>
 
- For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0156.html
+ For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0177.html
 
 from user code:
    File "test_error_messages.py", line N, in fn

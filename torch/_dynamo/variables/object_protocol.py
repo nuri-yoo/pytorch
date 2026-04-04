@@ -9,13 +9,20 @@ Per-type richcompare_impl hooks live in their respective VT files.
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from torch._C._dynamo import get_type_slots, has_slot, PyMappingSlots, PySequenceSlots
+from torch._C._dynamo import (
+    get_type_slots,
+    has_slot,
+    PyMappingSlots,
+    PySequenceSlots,
+    PyTypeSlots,
+)
 
-from .. import graph_break_hints
-from ..exc import unimplemented
+from .. import graph_break_hints, polyfills
+from ..exc import raise_observed_exception, unimplemented
 from ..utils import istype
 from .base import NO_SUCH_SUBOBJ, raise_type_error_exc, VariableTracker
 from .constant import CONSTANT_VARIABLE_FALSE, CONSTANT_VARIABLE_TRUE
+from .functions import UserFunctionVariable
 
 
 type_error = raise_type_error_exc
@@ -79,6 +86,22 @@ def vt_identity_compare(
     return None
 
 
+def debug_tp_slots(obj: VariableTracker) -> None:
+    T = maybe_get_python_type(obj)
+    seq_slots, map_slots, num_slots, type_slots = _get_cached_slots(T)
+    print(f"Type {T} slots:")
+    for slot, enum in (
+        (seq_slots, PySequenceSlots),
+        (map_slots, PyMappingSlots),
+        (type_slots, PyTypeSlots),
+    ):
+        names: list[str] = []
+        for slot_name, slot_bit in enum.__members__.items():  # type: ignore[missing-attributes]
+            if has_slot(slot, slot_bit):
+                names.append(slot_name)
+        print(f"  {enum.__name__}: {', '.join(names)}")
+
+
 @lru_cache(maxsize=256)
 def _get_cached_slots(obj_type: type) -> tuple[int, int, int, int]:
     """Get all type slots for a type (cached)."""
@@ -95,6 +118,19 @@ def type_implements_mp_length(obj_type: type) -> bool:
     """Check whether obj_type implements __len__ as mapping protocol"""
     _, map_slots, _, _ = _get_cached_slots(obj_type)
     return has_slot(map_slots, PyMappingSlots.MP_LENGTH)
+
+
+def type_implements_tp_iter(obj_type: type) -> bool:
+    _, _, _, type_slot = _get_cached_slots(obj_type)
+    return has_slot(type_slot, PyTypeSlots.TP_ITER)
+
+
+def type_sequence_check(obj_type: type) -> bool:
+    """Implements PySequence_Check semantics for VariableTracker objects."""
+    if issubclass(obj_type, dict):
+        return False
+    seq_slots, _, _, _ = _get_cached_slots(obj_type)
+    return has_slot(seq_slots, PySequenceSlots.SQ_ITEM)
 
 
 def maybe_get_python_type(obj: VariableTracker) -> type:
@@ -139,3 +175,49 @@ def generic_len(
     if type_implements_sq_length(T):
         return obj.sq_length(tx)
     return vt_mapping_size(tx, obj)
+
+
+def generic_getitem(
+    tx: "InstructionTranslator", obj: "VariableTracker", item: "VariableTracker"
+) -> "VariableTracker":
+    """
+    Implements PyObject_GetItem semantics for VariableTracker objects.
+    Routes to obj.getitem_impl(tx, item)
+    """
+    return obj.call_method(tx, "__getitem__", [item], {})
+
+
+def generic_getiter(
+    tx: "InstructionTranslator", obj: "VariableTracker"
+) -> "VariableTracker":
+    """
+    Implements PyObject_GetIter semantics for VariableTracker objects.
+    Routes to obj.tp_iter(tx), the tp_iter slot on the object's type.
+    """
+    from .base import VariableTracker
+
+    # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#2848
+    # The algorithm for PyObject_GetIter is as follows: Steps:
+    # 1. If the object has tp_iter slot, call it and return the result The
+    #    return object must be an iterator (it must have a tp_iternext slot)
+    # 2. If the object implements the sequence protocol - implements __getitem__
+    #    and __len__, then create a sequence iterator for the object and return
+    #    it.
+    # 3. Otherwise, raise a TypeError
+
+    T = maybe_get_python_type(obj)
+    if type_implements_tp_iter(T):
+        return obj.tp_iter(tx)
+    elif type_sequence_check(T):
+        return UserFunctionVariable(polyfills.builtins.sequence_iterator).call_function(
+            tx, [obj], {}
+        )
+    else:
+        msg = VariableTracker.build(
+            tx, f"'{obj.python_type_name()}' object is not iterable"
+        )
+        raise_observed_exception(
+            TypeError,
+            tx,
+            args=[msg],
+        )
