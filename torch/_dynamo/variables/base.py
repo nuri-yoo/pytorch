@@ -579,6 +579,14 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             args=[f"object of type '{self.python_type_name()}' has no len()"],
         )
 
+    def sq_contains(self, tx: Any, item: "VariableTracker") -> "VariableTracker":
+        """Called when sq_contains is not implemented."""
+        raise_observed_exception(
+            TypeError,
+            tx,
+            args=[f"argument of type '{self.python_type_name()}' is not iterable"],
+        )
+
     def call_method(
         self,
         tx: Any,
@@ -598,6 +606,14 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             from .object_protocol import generic_iternext
 
             return generic_iternext(tx, self)
+        elif name == "__contains__" and not kwargs:
+            from .object_protocol import generic_contains
+
+            if len(args) != 1:
+                msg = VariableTracker.build(tx, f"expected 1 argument, got {len(args)}")
+                raise_observed_exception(TypeError, tx, args=[msg])
+
+            return generic_contains(tx, self, args[0])
         elif (
             name == "__getattr__"
             and len(args) == 1

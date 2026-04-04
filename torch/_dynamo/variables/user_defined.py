@@ -1528,6 +1528,18 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             kwargs,
         )
 
+    def sq_contains(
+        self, tx: "InstructionTranslator", item: VariableTracker
+    ) -> VariableTracker:
+        contains_fn = self._maybe_get_baseclass_method("__contains__")
+        if contains_fn and isinstance(contains_fn, types.FunctionType):
+            return variables.UserMethodVariable(
+                contains_fn,
+                self,
+                source=self.source and AttrSource(self.source, "__contains__"),
+            ).call_function(tx, [item], {})
+        return super().sq_contains(tx, item)
+
     def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
         iter_fn = self._maybe_get_baseclass_method("__iter__")
         if iter_fn:
@@ -3074,6 +3086,13 @@ class UserDefinedDictVariable(UserDefinedObjectVariable):
     def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
         return self._dict_vt.tp_iter(tx)
 
+    def sq_contains(
+        self, tx: "InstructionTranslator", item: VariableTracker
+    ) -> VariableTracker:
+        if self._maybe_get_baseclass_method("__contains__") in self._dict_methods:
+            return self._dict_vt.sq_contains(tx, item)
+        return super().sq_contains(tx, item)
+
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         if type(self.value).__iter__ in (  # type: ignore[attr-defined]
             dict.__iter__,
@@ -3173,6 +3192,13 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
     def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
         return self._set_vt.tp_iter(tx)
 
+    def sq_contains(
+        self, tx: "InstructionTranslator", item: VariableTracker
+    ) -> VariableTracker:
+        if self._maybe_get_baseclass_method("__contains__") in self._set_methods:
+            return self._set_vt.sq_contains(tx, item)
+        return super().sq_contains(tx, item)
+
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         if inspect.getattr_static(self.value, "__iter__") in (
             set.__iter__,
@@ -3257,6 +3283,13 @@ class UserDefinedListVariable(UserDefinedObjectVariable):
     def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
         assert self._list_vt is not None
         return self._list_vt.tp_iter(tx)
+
+    def sq_contains(
+        self, tx: "InstructionTranslator", item: VariableTracker
+    ) -> VariableTracker:
+        if self._maybe_get_baseclass_method("__contains__") in list_methods:
+            return self._list_vt.sq_contains(tx, item)
+        return super().sq_contains(tx, item)
 
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         assert self._list_vt is not None
@@ -3352,6 +3385,13 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
     def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
         assert self._tuple_vt is not None
         return self._tuple_vt.tp_iter(tx)
+
+    def sq_contains(
+        self, tx: "InstructionTranslator", item: VariableTracker
+    ) -> VariableTracker:
+        if self._maybe_get_baseclass_method("__contains__") in tuple_methods:
+            return self._tuple_vt.sq_contains(tx, item)
+        return super().sq_contains(tx, item)
 
     def unpack_var_sequence(self, tx: "InstructionTranslator") -> list[VariableTracker]:
         assert self._tuple_vt is not None

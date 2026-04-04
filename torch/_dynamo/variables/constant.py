@@ -192,6 +192,21 @@ its type to `common_constant_types`.
             raise NotImplementedError
         return member
 
+    def sq_contains(self, tx: "InstructionTranslator", item: "VariableTracker"):
+        """Sequence contains for constants."""
+        if item.is_python_constant():
+            search = item.as_python_constant()
+            try:
+                result = search in self.value
+                return ConstantVariable.create(result)
+            except TypeError as e:
+                raise_observed_exception(
+                    type(e),
+                    tx,
+                    args=list(e.args),
+                )
+        return super().sq_contains(tx, item)
+
     def tp_iter(self, tx: "InstructionTranslator") -> VariableTracker:
         from .lists import ListIteratorVariable
 
@@ -296,15 +311,9 @@ its type to `common_constant_types`.
                     round(self.value, args[0].as_python_constant())
                 )
             except Exception as e:
-                raise_observed_exception(type(e), tx, args=list(e.args))
-        elif name == "__contains__" and len(args) == 1 and args[0].is_python_constant():
-            assert not kwargs
-            search = args[0].as_python_constant()
-            try:
-                result = search in self.value
-                return ConstantVariable.create(result)
-            except TypeError as e:
-                raise_observed_exception(type(e), tx, args=list(e.args))
+                raise_observed_exception(
+                    type(e), tx, args=list(map(ConstantVariable.create, e.args))
+                )
         return super().call_method(tx, name, args, kwargs)
 
     def call_tree_map(
