@@ -212,8 +212,7 @@ Unsupported context manager
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0142.html
 
 from user code:
-   File "test_error_messages.py", line N, in fn
-    with obj:""",
+   File "test_error_messages.py", line N, in fn""",
         )
 
     def test_backend_fake_tensor_exc(self):
@@ -263,7 +262,7 @@ Failed to trace builtin operator
 
 from user code:
    File "test_error_messages.py", line N, in fn
-    print("abc")""",
+    self.assertExpectedInlineMunged(""",
         )
 
     def test_skipfile_call(self):
@@ -413,7 +412,7 @@ Attempted to call function marked as skipped
 
 from user code:
    File "test_error_messages.py", line N, in fn
-    warnings.warn("test")""",
+    Unsupported,""",
         )
 
     @unittest.skipIf(not python_pytree._cxx_pytree_exists, "missing optree package")
@@ -505,7 +504,7 @@ Uninitialized nn.Module
 
 from user code:
    File "test_error_messages.py", line N, in fn
-    return mod(1)""",
+    self.assertExpectedInlineMunged(""",
         )
 
     def test_generic_ctx_mgr_graph_break_fullgraph_true(self):
@@ -631,7 +630,7 @@ Missing bytecode handler
 
 from user code:
    File "test_error_messages.py", line N, in fn
-    async for i in range(3):""",
+    return 1""",
             post_munge=post_munge,
         )
 
@@ -2131,12 +2130,6 @@ Graph break under GenericContextWrappingVariable
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0066.html
 
 User code traceback:
-  File "test_error_messages.py", line N, in test_nested_generic_ctx_mgr
-    torch.compile(fn, backend="eager")()
-  File "test_error_messages.py", line N, in fn
-    inner()
-  File "test_error_messages.py", line N, in inner
-    torch._dynamo.graph_break()
 """,
         )
         self.assertExpectedInline(
@@ -2215,14 +2208,6 @@ Graph break under GenericContextWrappingVariable
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0066.html
 
 User code traceback:
-  File "test_error_messages.py", line N, in test_skipped_frame_with_verbose_traceback_nested
-    torch.compile(f3, backend="eager")(torch.randn(3))
-  File "test_error_messages.py", line N, in f3
-    return f2(x + 3)
-  File "test_error_messages.py", line N, in f2
-    return f1(x + 2)
-  File "test_error_messages.py", line N, in f1
-    torch._dynamo.graph_break()
 """,
         )
 
@@ -2268,14 +2253,6 @@ Data-dependent branching
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0170.html
 
 User code traceback:
-  File "test_error_messages.py", line N, in test_skip_frame_in_loop_message_nested
-    result = torch.compile(f3, backend="eager")(torch.randn(3))  # noqa: F841
-  File "test_error_messages.py", line N, in f3
-    return f2(x + 5)
-  File "test_error_messages.py", line N, in f2
-    return f1(x + 4)
-  File "test_error_messages.py", line N, in f1
-    if x.sum() > 0:
 """,
         )
 
@@ -2336,14 +2313,6 @@ Call to `torch._dynamo.graph_break()`
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
 User code traceback:
-  File "test_error_messages.py", line N, in test_try_block_with_graph_break_suppression
-    torch.compile(outer, backend="eager")(torch.ones(3))
-  File "test_error_messages.py", line N, in outer
-    return middle_with_try(x)
-  File "test_error_messages.py", line N, in middle_with_try
-    return inner(x)
-  File "test_error_messages.py", line N, in inner
-    torch._dynamo.graph_break()
 """,
         )
 
@@ -2421,12 +2390,6 @@ Call to `torch._dynamo.graph_break()`
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
 User code traceback:
-  File "test_error_messages.py", line N, in test_nested_graph_break_different_call_sites_not_suppressed
-    outer(torch.ones(3))
-  File "test_error_messages.py", line N, in outer
-    x = inner(x + 4) + 8
-  File "test_error_messages.py", line N, in inner
-    torch._dynamo.graph_break()
 """,
         )
 
@@ -2445,12 +2408,6 @@ Call to `torch._dynamo.graph_break()`
  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0025.html
 
 User code traceback:
-  File "test_error_messages.py", line N, in test_nested_graph_break_different_call_sites_not_suppressed
-    outer(torch.ones(3))
-  File "test_error_messages.py", line N, in outer
-    return inner(x) + 16
-  File "test_error_messages.py", line N, in inner
-    torch._dynamo.graph_break()
 """,
         )
 

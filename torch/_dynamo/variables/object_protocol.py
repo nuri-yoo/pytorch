@@ -18,7 +18,7 @@ from torch._C._dynamo import (
 )
 
 from .. import graph_break_hints, polyfills
-from ..exc import raise_observed_exception, unimplemented
+from ..exc import unimplemented
 from ..utils import istype
 from .base import NO_SUCH_SUBOBJ, raise_type_error_exc, VariableTracker
 from .constant import CONSTANT_VARIABLE_FALSE, CONSTANT_VARIABLE_TRUE
@@ -86,10 +86,9 @@ def vt_identity_compare(
     return None
 
 
-def debug_tp_slots(obj: VariableTracker) -> None:
-    T = maybe_get_python_type(obj)
-    seq_slots, map_slots, num_slots, type_slots = _get_cached_slots(T)
-    print(f"Type {T} slots:")
+def debug_tp_slots(obj_type: type) -> None:
+    seq_slots, map_slots, _, type_slots = _get_cached_slots(obj_type)
+    print(f"Type {obj_type} slots:")
     for slot, enum in (
         (seq_slots, PySequenceSlots),
         (map_slots, PyMappingSlots),
@@ -123,6 +122,11 @@ def type_implements_mp_length(obj_type: type) -> bool:
 def type_implements_tp_iter(obj_type: type) -> bool:
     _, _, _, type_slot = _get_cached_slots(obj_type)
     return has_slot(type_slot, PyTypeSlots.TP_ITER)
+
+
+def type_implements_tp_iternext(obj_type: type) -> bool:
+    _, _, _, type_slot = _get_cached_slots(obj_type)
+    return has_slot(type_slot, PyTypeSlots.TP_ITERNEXT)
 
 
 def type_sequence_check(obj_type: type) -> bool:
@@ -187,6 +191,26 @@ def generic_getitem(
     return obj.call_method(tx, "__getitem__", [item], {})
 
 
+def generic_iternext(
+    tx: "InstructionTranslator", obj: "VariableTracker"
+) -> "VariableTracker":
+    """
+    Implements PyIter_Next / tp_iternext semantics for VariableTracker objects.
+
+    Calls obj.tp_iternext(tx) if the object is an iterator, otherwise raises
+    TypeError. StopIteration propagation is left to the caller (mirrors
+    CPython's iternext contract where NULL return signals exhaustion).
+    """
+    # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#L2865
+
+    T = maybe_get_python_type(obj)
+    if not type_implements_tp_iternext(T):
+        type_error(tx, f"'{obj.python_type_name()}' object is not an iterator")
+
+    return obj.tp_iternext(tx)
+
+
+# TODO(guilhermeleobas): should we narrow the return type to IteratorVariable?
 def generic_getiter(
     tx: "InstructionTranslator", obj: "VariableTracker"
 ) -> "VariableTracker":
@@ -194,7 +218,6 @@ def generic_getiter(
     Implements PyObject_GetIter semantics for VariableTracker objects.
     Routes to obj.tp_iter(tx), the tp_iter slot on the object's type.
     """
-    from .base import VariableTracker
 
     # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#2848
     # The algorithm for PyObject_GetIter is as follows: Steps:
@@ -207,17 +230,17 @@ def generic_getiter(
 
     T = maybe_get_python_type(obj)
     if type_implements_tp_iter(T):
-        return obj.tp_iter(tx)
+        res = obj.tp_iter(tx)
+        res_T = maybe_get_python_type(res)
+        if not type_implements_tp_iternext(res_T):
+            type_error(
+                tx,
+                f"{obj.python_type_name()}.__iter__() returned non-iterator {res.python_type_name()}",
+            )
+        return res
     elif type_sequence_check(T):
         return UserFunctionVariable(polyfills.builtins.sequence_iterator).call_function(
             tx, [obj], {}
         )
     else:
-        msg = VariableTracker.build(
-            tx, f"'{obj.python_type_name()}' object is not iterable"
-        )
-        raise_observed_exception(
-            TypeError,
-            tx,
-            args=[msg],
-        )
+        type_error(tx, f"'{obj.python_type_name()}' object is not iterable")
