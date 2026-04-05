@@ -178,6 +178,7 @@ Loss functions
     hinge_embedding_loss
     kl_div
     l1_loss
+    linear_cross_entropy
     mse_loss
     margin_ranking_loss
     multilabel_margin_loss
@@ -231,3 +232,12 @@ Low-Precision functions
     grouped_mm
     scaled_mm
     scaled_grouped_mm
+
+Miscellaneous
+-------------
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    LinearCrossEntropyOptions
