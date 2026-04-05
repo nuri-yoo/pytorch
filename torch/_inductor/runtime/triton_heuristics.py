@@ -434,6 +434,9 @@ class CachingAutotuner(KernelInterface):
 
         self.triton_interpret = os.environ.get("TRITON_INTERPRET", "0") == "1"
 
+        self._debug_call: Any = None  # Only set/read from run() on the main thread
+        self._profiler_ctx: Any = None
+
         # Compile-time info included in runtime logginging
         self.compile_id: CompileId | None = None
         self.is_backward = False
@@ -1646,6 +1649,40 @@ class CachingAutotuner(KernelInterface):
             ret["kernel_num_gb"] = self.inductor_meta["kernel_num_gb"]
         return ret
 
+    def _pre_launch(self, launcher, *args, stream, **kwargs):
+        """Pre-launch instrumentation: param/tensor dumping and profiler context entry."""
+        if self.dump_launch_params:
+            new_args, grid = self._interpret_args_grid(args, launcher.config)
+            _dump_launch_params(new_args, kwargs, launcher, self.fn.__name__, grid)
+
+        if self.dump_launch_tensors:
+            if not self.kernels_to_dump or any(
+                kernel_name in self.fn.__name__ for kernel_name in self.kernels_to_dump
+            ):
+                _dump_launch_tensors(
+                    args, self.filename, self.kernel_hash, self.fn.__name__
+                )
+
+        if autograd_profiler._is_profiler_enabled:
+            profiler_kwargs = self.get_profiler_kwargs(stream, launcher)
+            self._profiler_ctx = torch._C._profiler._RecordFunctionFast(
+                self.inductor_meta.get("kernel_name", "triton kernel"),
+                tuple(args),
+                profiler_kwargs,
+            )
+            self._profiler_ctx.__enter__()
+        else:
+            self._profiler_ctx = None
+
+    def _post_launch(self) -> None:
+        """Post-launch instrumentation: profiler context exit and debug mode finalization."""
+        if self._profiler_ctx is not None:
+            self._profiler_ctx.__exit__(None, None, None)
+            self._profiler_ctx = None
+        if self._debug_call is not None:
+            self._debug_call.finalize(self.get_device_interface())
+            self._debug_call = None
+
     def run(
         self,
         *args,
@@ -1655,12 +1692,11 @@ class CachingAutotuner(KernelInterface):
     ):  # type:ignore[override]
         """Launch triton kernel call and return result."""
         debug_mode = get_active_debug_mode()
-        debug_call = None
         if debug_mode:
             arg_names = list(self.triton_meta.get("signature", {}).keys())
             kernel_kwargs = dict(zip(arg_names, args))
             kernel_kwargs.update(kwargs)
-            debug_call = debug_mode.record_triton_kernel(
+            self._debug_call = debug_mode.record_triton_kernel(
                 kernel_name=self.fn.__name__, kwargs=kernel_kwargs
             )
 
@@ -1722,48 +1758,11 @@ class CachingAutotuner(KernelInterface):
         if launcher.store_cubin and (not benchmark_run or not self.cuda_kernel_saved):
             self.save_gpu_kernel(stream, launcher)
 
-        # PyTorch execution trace replay calls CachingAutotuner::run() instead of calls launcher
-        # so _RecordFunctionFast need to capture the args into CachingAutotuner::run()
-        # make a copy here to avoid mutating the original args
-        args_without_constexprs = tuple(args)
-
-        if self.dump_launch_params:
-            new_args, grid = self._interpret_args_grid(args, launcher.config)
-            _dump_launch_params(new_args, kwargs, launcher, self.fn.__name__, grid)
-
-        if self.dump_launch_tensors:
-            # Check the kernel name if the list was provided
-            if not self.kernels_to_dump or any(
-                kernel_name in self.fn.__name__ for kernel_name in self.kernels_to_dump
-            ):
-                _dump_launch_tensors(
-                    args, self.filename, self.kernel_hash, self.fn.__name__
-                )
-
-        # it is faster than entering and exiting a context manager, even if the context
-        # manager is a nullcontext.
-        if autograd_profiler._is_profiler_enabled:
-            profiler_kwargs = self.get_profiler_kwargs(stream, launcher)
-
-            with torch._C._profiler._RecordFunctionFast(
-                self.inductor_meta.get("kernel_name", "triton kernel"),
-                args_without_constexprs,
-                profiler_kwargs,
-            ):
-                result = launcher(
-                    *args,
-                    **kwargs,
-                    stream=stream,
-                )
-        else:
-            result = launcher(
-                *args,
-                **kwargs,
-                stream=stream,
-            )
-
-        if debug_call:
-            debug_call.finalize(self.get_device_interface())
+        try:
+            self._pre_launch(launcher, *args, stream=stream, **kwargs)
+            result = launcher(*args, **kwargs, stream=stream)
+        finally:
+            self._post_launch()
         return result
 
     def _interpret_args_grid(
