@@ -41,6 +41,11 @@ from . import triton_helpers
 from .autotune_cache import AutotuneCache
 from .benchmarking import benchmarker
 from .coordinate_descent_tuner import CoordescTuner
+from .incremental import (
+    IncrementalAutotuneState,
+    jk_passes as incremental_autotune_jk_passes,
+    log as incremental_log,
+)
 from .hints import (
     _NUM_THREADS_PER_WARP,
     AutotuneHint,
@@ -437,6 +442,8 @@ class CachingAutotuner(KernelInterface):
         self._debug_call: Any = None  # Only set/read from run() on the main thread
         self._profiler_ctx: Any = None
 
+        self._incremental_state: IncrementalAutotuneState | None = None
+
         # Compile-time info included in runtime logginging
         self.compile_id: CompileId | None = None
         self.is_backward = False
@@ -495,6 +502,31 @@ class CachingAutotuner(KernelInterface):
     def set_compile_info(self, compile_id: CompileId | None, is_backward: bool) -> None:
         self.compile_id = compile_id
         self.is_backward = is_backward
+
+    def _should_use_incremental_autotune(self) -> bool:
+        """Check if this kernel should use incremental autotuning."""
+        if not self.inductor_meta.get("incremental_autotune", False):
+            return False
+        if inductor_triton_config.autotune_at_compile_time:
+            log.warning(
+                "Incremental autotune: skipping %s — autotune_at_compile_time=True",
+                self.fn.__name__,
+            )
+            return False
+        if inductor_triton_config.cudagraphs:
+            log.warning(
+                "Incremental autotune: skipping %s — cudagraphs=True",
+                self.fn.__name__,
+            )
+            return False
+        if not incremental_autotune_jk_passes():
+            log.warning(
+                "Incremental autotune: skipping %s — JK gate blocked",
+                self.fn.__name__,
+            )
+            return False
+        log.debug("Incremental autotune: enabled for %s", self.fn.__name__)
+        return True
 
     def precompile(
         self,
@@ -657,6 +689,57 @@ class CachingAutotuner(KernelInterface):
 
             self._make_launchers()
 
+    def _initialize_incremental_autotune(self) -> None:
+        """Initialize incremental autotuning from pre-built launchers.
+
+        Expects self.launchers to be populated (via _make_launchers) before
+        this is called. Clears self.launchers and hands them to the state,
+        which manages round-robin dispatch and convergence.
+        """
+        assert not self._incremental_state
+
+        launchers = list(self.launchers)
+        self.launchers = []
+        incremental_log.debug(
+            "Incremental autotune: initializing for %s with %d launchers",
+            self.fn.__name__,
+            len(launchers),
+        )
+
+        def on_convergence(state):
+            assert state.best_launcher
+            with self.lock:
+                self.launchers = [state.best_launcher]
+                self._incremental_state = None
+            incremental_log.debug(
+                "Incremental autotune converged for %s: %s (mean=%.3f ms)",
+                self.fn.__name__,
+                state.best_launcher.config,
+                state.best_mean,
+            )
+
+        def on_cleanup(state):
+            if state.best_launcher is None:
+                return
+            self.autotune_time_taken_ns = state._total_dispatch_ns
+            if self.save_cache_hook:
+                self.save_cache_hook(
+                    state.best_launcher.config,
+                    state._total_dispatch_ns,
+                    found_by_coordesc=getattr(
+                        state.best_launcher.config, "found_by_coordesc", False
+                    ),
+                    triton_cache_hash=state.best_launcher.cache_hash,
+                )
+
+        self._incremental_state = IncrementalAutotuneState(
+            launchers=launchers,
+            on_convergence_fn=on_convergence,
+            on_cleanup_fn=on_cleanup,
+            pre_launch_fn=self._pre_launch,
+            post_launch_fn=self._post_launch,
+        )
+
     def _make_launchers(self):
         if len(self.launchers) == len(self.compile_results):
             return
@@ -739,6 +822,7 @@ class CachingAutotuner(KernelInterface):
         return {
             **self.__dict__,
             "lock": None,
+            "_incremental_state": None,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -1717,12 +1801,18 @@ class CachingAutotuner(KernelInterface):
                 **self.configs[0].kwargs,
             )
 
+        if self._incremental_state:
+            return self._incremental_state.dispatch(*args, stream=stream, **kwargs)
+
         if len(self.launchers) != 1:
             if len(self.launchers) == 0:
                 start_time = time.time_ns()
                 self.precompile()
                 self.precompile_time_taken_ns = time.time_ns() - start_time
             if len(self.launchers) > 1:
+                if self._should_use_incremental_autotune():
+                    self._initialize_incremental_autotune()
+                    return self._incremental_state.dispatch(*args, stream=stream, **kwargs)
                 self.autotune_to_one_config(*args, **kwargs)
 
         if self.inductor_meta.get("combo_tuning_groups") and not getattr(
