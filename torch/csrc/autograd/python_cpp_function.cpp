@@ -330,8 +330,7 @@ bool THPCppFunction_Check(PyObject* obj) {
   if ((PyTypeObject*)type.get() == get_default_type()) {
     return true;
   }
-  if (cpp_function_types_set.find((PyTypeObject*)type.get()) ==
-      cpp_function_types_set.end()) {
+  if (!cpp_function_types_set.contains((PyTypeObject*)type.get())) {
     return false;
   } else {
     return true;
