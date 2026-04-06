@@ -149,6 +149,9 @@ def _get_mesh_info_from_named_dims(
     )
 
 
+_post_forward_mesh_info_cache: dict[tuple[int, DeviceMesh], FSDPMeshInfo] = {}
+
+
 def _get_post_forward_mesh_info(
     reshard_after_forward: bool | int, mesh_info: FSDPMeshInfo
 ) -> FSDPMeshInfo | None:
@@ -184,6 +187,9 @@ def _get_post_forward_mesh_info(
     if reshard_after_forward is True:
         post_forward_mesh_info = mesh_info
     elif reshard_after_forward is not False:  # int case
+        cache_key = (reshard_after_forward, mesh_info.mesh)
+        if cache_key in _post_forward_mesh_info_cache:
+            return _post_forward_mesh_info_cache[cache_key]
         # For HSDP, we can flatten the two replicate dims into the 0th dim
         post_forward_mesh_tensor = mesh_info.mesh.mesh.view(-1, reshard_after_forward)
         post_forward_mesh = DeviceMesh(
@@ -192,6 +198,7 @@ def _get_post_forward_mesh_info(
         post_forward_mesh_info = HSDPMeshInfo(
             post_forward_mesh, shard_mesh_dim=1, replicate_mesh_dim=0
         )
+        _post_forward_mesh_info_cache[cache_key] = post_forward_mesh_info
     return post_forward_mesh_info
 
 
