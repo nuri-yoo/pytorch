@@ -113,7 +113,7 @@ jobs:
   # See P2188981399 for the full CI workflow analysis.
 
   linux-jammy-cuda13_0-py3_10-gcc11-build:
-    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-cuda13.0-py3.10-gcc11 ') }}
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-cuda13.0-py3.10-gcc11 ') || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test-cuda13 ') }}
     name: linux-jammy-cuda13.0-py3.10-gcc11
     uses: ./.github/workflows/_linux-build.yml
     needs:
@@ -262,6 +262,19 @@ jobs:
       runner: "${{ needs.get-label-type.outputs.label-type }}windows.4xlarge.nonephemeral"
     secrets: inherit
 
+  win-vs2022-cuda13_0-py3-build:
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' win-vs2022-cuda13.0-py3 ') || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test-cuda13 ') }}
+    name: win-vs2022-cuda13.0-py3
+    uses: ./.github/workflows/_win-build.yml
+    needs:
+      - get-label-type
+      - job-filter
+    with:
+      build-environment: win-vs2022-cuda13.0-py3
+      cuda-version: "13.0"
+      runner: "${{ needs.get-label-type.outputs.label-type }}windows.4xlarge.nonephemeral"
+    secrets: inherit
+
   linux-jammy-rocm-py3_10-build:
     name: linux-jammy-rocm-py3.10-mi355
     uses: ./.github/workflows/_linux-build.yml
@@ -330,6 +343,26 @@ jobs:
       test-matrix: |
         { include: [
           { config: "aoti_cross_compile_for_windows", shard: 1, num_shards: 1, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g6.4xlarge.experimental.nvidia.gpu", win_torch_wheel_artifact: "win-vs2022-cuda12.8-py3" },
+        ]}
+      tests-to-include: ${{ github.event.inputs.tests-to-include || '' }}
+    secrets: inherit
+
+  # Test cross-compiled models with Windows libs extracted from wheel (CUDA 13.0)
+  cross-compile-linux-test-cuda13:
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test-cuda13 ') }}
+    name: cross-compile-linux-test-cuda13
+    uses: ./.github/workflows/_linux-test.yml
+    needs:
+      - linux-jammy-cuda13_0-py3_10-gcc11-build
+      - get-label-type
+      - win-vs2022-cuda13_0-py3-build
+      - job-filter
+    with:
+      build-environment: ${{ needs.linux-jammy-cuda13_0-py3_10-gcc11-build.outputs.build-environment }}
+      docker-image: ${{ needs.linux-jammy-cuda13_0-py3_10-gcc11-build.outputs.docker-image }}
+      test-matrix: |
+        { include: [
+          { config: "aoti_cross_compile_for_windows", shard: 1, num_shards: 1, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g6.4xlarge.experimental.nvidia.gpu", win_torch_wheel_artifact: "win-vs2022-cuda13.0-py3" },
         ]}
       tests-to-include: ${{ github.event.inputs.tests-to-include || '' }}
     secrets: inherit

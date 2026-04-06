@@ -1,15 +1,19 @@
 # Owner(s): ["module: inductor"]
 import os
 import platform
+import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch._inductor.config
 from torch._environment import is_fbcode
+from torch._inductor.cpp_builder import _ensure_mingw_cudart_import_lib
 from torch._inductor.test_case import TestCase
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU, requires_gpu
 
@@ -316,6 +320,168 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
             rtol=1e-3,
             atol=1e-3,
         )
+
+
+class TestEnsureMingwCudartImportLib(TestCase):
+    """Unit tests for _ensure_mingw_cudart_import_lib (CUDA 13.0+ support)."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp_dir = tempfile.mkdtemp(prefix="test_mingw_cudart_")
+        self.cuda_home = os.path.join(self.tmp_dir, "cuda")
+        self.lib_dir = os.path.join(self.tmp_dir, "lib")
+        os.makedirs(os.path.join(self.cuda_home, "bin", "x64"), exist_ok=True)
+        os.makedirs(self.lib_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        super().tearDown()
+
+    def _create_fake_dll(self, version: str = "130") -> str:
+        dll_path = os.path.join(self.cuda_home, "bin", "x64", f"cudart64_{version}.dll")
+        Path(dll_path).touch()
+        return dll_path
+
+    def _create_fake_cudart_lib(self) -> str:
+        lib_path = os.path.join(self.lib_dir, "cudart.lib")
+        Path(lib_path).touch()
+        return lib_path
+
+    @patch("torch.version.cuda", "12.8")
+    def test_noop_when_cuda_below_13(self):
+        """Should return immediately when CUDA version is below 13.0."""
+        _ensure_mingw_cudart_import_lib([self.lib_dir])
+        self.assertFalse(os.path.exists(os.path.join(self.lib_dir, "libcudart.a")))
+
+    @patch("torch.version.cuda", None)
+    def test_noop_when_cuda_version_is_none(self):
+        """Should return immediately when CUDA version is None."""
+        _ensure_mingw_cudart_import_lib([self.lib_dir])
+        self.assertFalse(os.path.exists(os.path.join(self.lib_dir, "libcudart.a")))
+
+    @patch("torch.version.cuda", "13.0")
+    def test_error_when_no_windows_cuda_home(self):
+        """Should raise RuntimeError when WINDOWS_CUDA_HOME is not set for CUDA 13.0+."""
+        env = os.environ.copy()
+        env.pop("WINDOWS_CUDA_HOME", None)
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(RuntimeError):
+                _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+    @patch("torch.version.cuda", "13.0")
+    def test_noop_when_libcudart_a_already_exists(self):
+        """Should skip generation if libcudart.a already exists."""
+        existing = os.path.join(self.lib_dir, "libcudart.a")
+        Path(existing).touch()
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            _ensure_mingw_cudart_import_lib([self.lib_dir])
+        self.assertTrue(os.path.exists(existing))
+
+    @patch("torch.version.cuda", "13.0")
+    def test_error_when_no_dll_found(self):
+        """Should raise RuntimeError when no cudart64_*.dll is found for CUDA 13.0+."""
+        self._create_fake_cudart_lib()
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            with self.assertRaises(RuntimeError):
+                _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+    @patch("torch.version.cuda", "13.0")
+    def test_error_when_no_writable_dir_with_cudart_lib(self):
+        """Should raise RuntimeError when no writable directory contains cudart.lib for CUDA 13.0+."""
+        self._create_fake_dll()
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            with self.assertRaises(RuntimeError):
+                _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+    @patch("torch.version.cuda", "13.0")
+    @patch("subprocess.run")
+    def test_successful_generation(self, mock_run: MagicMock):
+        """Should call gendef and dlltool when all conditions are met."""
+        dll_path = self._create_fake_dll()
+        self._create_fake_cudart_lib()
+
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+        self.assertEqual(mock_run.call_count, 2)
+
+        # Verify gendef call
+        gendef_call = mock_run.call_args_list[0]
+        gendef_cmd = gendef_call[0][0]
+        self.assertEqual(gendef_cmd[0], "gendef")
+        self.assertEqual(gendef_cmd[1], "-")
+        self.assertEqual(gendef_cmd[2], dll_path)
+
+        # Verify dlltool call
+        dlltool_call = mock_run.call_args_list[1]
+        dlltool_cmd = dlltool_call[0][0]
+        self.assertEqual(dlltool_cmd[0], "x86_64-w64-mingw32-dlltool")
+        self.assertIn("-d", dlltool_cmd)
+        self.assertIn("-l", dlltool_cmd)
+        self.assertIn("-D", dlltool_cmd)
+        self.assertIn("cudart64_130.dll", dlltool_cmd)
+
+    @patch("torch.version.cuda", "13.0")
+    @patch("subprocess.run", side_effect=FileNotFoundError("gendef not found"))
+    def test_graceful_fallback_on_gendef_not_found(self, mock_run: MagicMock):
+        """Should not crash when gendef is not installed."""
+        self._create_fake_dll()
+        self._create_fake_cudart_lib()
+
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+        self.assertFalse(os.path.exists(os.path.join(self.lib_dir, "libcudart.a")))
+
+    @patch("torch.version.cuda", "13.0")
+    @patch("subprocess.run")
+    def test_cleanup_on_dlltool_failure(self, mock_run: MagicMock):
+        """Should clean up partial artifacts when dlltool fails."""
+        self._create_fake_dll()
+        self._create_fake_cudart_lib()
+
+        def side_effect(*args, **kwargs):
+            cmd = args[0]
+            if cmd[0] == "gendef":
+                return MagicMock()
+            raise subprocess.CalledProcessError(1, cmd)
+
+        mock_run.side_effect = side_effect
+
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+        self.assertFalse(os.path.exists(os.path.join(self.lib_dir, "libcudart.a")))
+
+    @patch("torch.version.cuda", "13.0")
+    @patch("subprocess.run")
+    def test_bin_x64_fallback_to_bin(self, mock_run: MagicMock):
+        """Should fall back to bin/ when bin/x64/ does not exist."""
+        shutil.rmtree(os.path.join(self.cuda_home, "bin", "x64"))
+        bin_dir = os.path.join(self.cuda_home, "bin")
+        dll_path = os.path.join(bin_dir, "cudart64_130.dll")
+        Path(dll_path).touch()
+        self._create_fake_cudart_lib()
+
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+        self.assertEqual(mock_run.call_count, 2)
+        gendef_cmd = mock_run.call_args_list[0][0][0]
+        self.assertIn(dll_path, gendef_cmd)
+
+    @patch("torch.version.cuda", "13.0")
+    @patch("subprocess.run")
+    def test_picks_first_dll_candidate(self, mock_run: MagicMock):
+        """Should use the first cudart64_*.dll found when multiple exist."""
+        self._create_fake_dll("130")
+        self._create_fake_dll("131")
+        self._create_fake_cudart_lib()
+
+        with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
+            _ensure_mingw_cudart_import_lib([self.lib_dir])
+
+        self.assertEqual(mock_run.call_count, 2)
 
 
 if __name__ == "__main__":

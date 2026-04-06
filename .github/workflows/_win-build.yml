@@ -193,9 +193,16 @@ jobs:
             cp "${CUDA_PATH}/lib/x64/cudart.lib" /c/${{ github.run_id }}/build-results/
           fi
 
+          # Copy CUDA runtime DLL (needed for MinGW import lib generation on CUDA 13.0+)
+          for dll in "${CUDA_PATH}"/bin/cudart64_*.dll; do
+            if [ -f "$dll" ]; then
+              cp "$dll" /c/${{ github.run_id }}/build-results/
+            fi
+          done
+
           # List collected files
-          echo "Collected CUDA libs:"
-          ls -lah /c/${{ github.run_id }}/build-results/*.lib
+          echo "Collected CUDA libs and DLLs:"
+          ls -lah /c/${{ github.run_id }}/build-results/*.lib /c/${{ github.run_id }}/build-results/*.dll 2>/dev/null || true
 
       # Upload to github so that people can click and download artifacts
       - name: Upload artifacts to s3
