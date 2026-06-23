@@ -10529,6 +10529,98 @@ class TestNLLLoss(TestCaseMPS):
             torch.ops.aten.nll_loss_backward(grad_out, inp, label, None, 1, -100, total_weight)
 
 
+class TestCTCLoss(TestCaseMPS):
+    def _ctc_loss_helper(self, T, C, N, target_lengths, input_lengths, *,
+                         targets_1d, target_dtype, dtype=torch.float, blank=0,
+                         zero_infinity=False, reduction="mean"):
+        # CPU is the reference; MPS is a clone of it. log_probs is (T, N, C).
+        # The CPU reference always runs in float (it has no Half kernel); for the
+        # half case MPS runs in half and is compared to the float reference, so
+        # assertEqual uses the dtype-aware fp16 tolerance.
+        log_probs = torch.randn(T, C, N, device="cpu").log_softmax(2).transpose(1, 2).detach()
+        log_probs = log_probs.contiguous().requires_grad_()
+        log_probs_mps = log_probs.detach().clone().to(device="mps", dtype=dtype).requires_grad_()
+
+        if targets_1d:
+            targets = torch.randint(1, C, (sum(target_lengths),), dtype=target_dtype, device="cpu")
+        else:
+            max_tl = max(target_lengths) if len(target_lengths) else 0
+            targets = torch.randint(1, C, (N, max_tl), dtype=target_dtype, device="cpu")
+        targets_mps = targets.detach().clone().to("mps")
+
+        il = torch.tensor(input_lengths, dtype=torch.long)
+        tl = torch.tensor(target_lengths, dtype=torch.long)
+
+        loss_cpu = F.ctc_loss(log_probs, targets, il, tl, blank=blank,
+                              reduction=reduction, zero_infinity=zero_infinity)
+        loss_mps = F.ctc_loss(log_probs_mps, targets_mps, il, tl, blank=blank,
+                              reduction=reduction, zero_infinity=zero_infinity)
+        # The CPU reference is always float. For the half case compare values
+        # only (exact_dtype=False) with an explicit fp16 tolerance, since the MPS
+        # output is half while the reference is float.
+        if dtype == torch.float:
+            tol = {}
+        else:
+            tol = {"exact_dtype": False, "atol": 1e-3, "rtol": 1e-2}
+        self.assertEqual(loss_cpu, loss_mps.to("cpu"), **tol)
+
+        loss_cpu.sum().backward()
+        loss_mps.sum().backward()
+        self.assertEqual(log_probs.grad, log_probs_mps.grad.to("cpu"), **tol)
+
+    def test_ctc_loss_basic(self):
+        # 1D (concatenated) and 2D (padded) targets, int32 and int64.
+        for targets_1d in (True, False):
+            for target_dtype in (torch.int, torch.long):
+                self._ctc_loss_helper(
+                    T=50, C=20, N=16,
+                    target_lengths=[30, 25, 20, 15, 30, 25, 20, 15, 30, 25, 20, 15, 30, 25, 20, 15],
+                    input_lengths=[50] * 16,
+                    targets_1d=targets_1d, target_dtype=target_dtype)
+
+    def test_ctc_loss_reductions(self):
+        for reduction in ("none", "mean", "sum"):
+            self._ctc_loss_helper(
+                T=40, C=15, N=8,
+                target_lengths=[20, 18, 16, 14, 20, 18, 16, 14],
+                input_lengths=[40] * 8,
+                targets_1d=True, target_dtype=torch.long, reduction=reduction)
+
+    def test_ctc_loss_varying_input_lengths(self):
+        # input_lengths shorter than T exercises the t >= input_length tail.
+        self._ctc_loss_helper(
+            T=50, C=20, N=4,
+            target_lengths=[10, 12, 8, 15],
+            input_lengths=[40, 35, 50, 45],
+            targets_1d=True, target_dtype=torch.long)
+
+    def test_ctc_loss_zero_infinity(self):
+        # target longer than input forces an infinite loss; zero_infinity zeroes it.
+        self._ctc_loss_helper(
+            T=10, C=10, N=3,
+            target_lengths=[15, 8, 20],
+            input_lengths=[10, 10, 10],
+            targets_1d=True, target_dtype=torch.long, zero_infinity=True)
+
+    def test_ctc_loss_empty_target(self):
+        # target_length == 0: loss is just the all-blank path.
+        self._ctc_loss_helper(
+            T=20, C=10, N=4,
+            target_lengths=[0, 5, 0, 8],
+            input_lengths=[20] * 4,
+            targets_1d=True, target_dtype=torch.long)
+
+    def test_ctc_loss_half(self):
+        # half MPS vs the float CPU reference. Accumulation is float internally,
+        # so the result tracks the reference within fp16 tolerance (assertEqual
+        # picks the tolerance from the half output dtype).
+        self._ctc_loss_helper(
+            T=50, C=20, N=8,
+            target_lengths=[20, 18, 16, 14, 20, 18, 16, 14],
+            input_lengths=[50] * 8,
+            targets_1d=True, target_dtype=torch.long, dtype=torch.half)
+
+
 class TestTopK(TestCase):
     def _test_topk(self, shape, largest):
         cpu_x = torch.randn(shape, device='cpu', dtype=torch.float, requires_grad=False)

@@ -543,8 +543,13 @@ Tensor ctc_loss_impl(const Tensor& log_probs_, const Tensor& targets, LengthsTyp
     }
   }
   if (reduction == at::Reduction::Mean) {
-    auto target_lengths_t = get_clamped_target_length(target_lengths, res.options());
-    return (res / target_lengths_t).mean();
+    // For a half loss, do the division in float and cast back: half is a valid
+    // loss dtype on MPS, but at::tensor (and the division) have no Half kernel
+    // on some backends. float/double are unchanged. Half ctc_loss only reaches
+    // here on MPS; CPU/CUDA never dispatch half to a native kernel.
+    auto compute_dtype = res.scalar_type() == at::kHalf ? at::kFloat : res.scalar_type();
+    auto target_lengths_t = get_clamped_target_length(target_lengths, res.options().dtype(compute_dtype));
+    return (res.to(compute_dtype) / target_lengths_t).mean().to(res.scalar_type());
   } else if (reduction == at::Reduction::Sum) {
     return res.sum();
   }
